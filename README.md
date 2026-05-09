@@ -22,7 +22,7 @@
 **Что нужно:** [Node.js 20+](https://nodejs.org/).
 
 ```powershell
-git clone <repo-url> bybit-service
+git clone https://github.com/p-repin/bybit_mirror bybit-service
 cd bybit-service\web
 npm install
 npm run dev
