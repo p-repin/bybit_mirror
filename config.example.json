@@ -1,0 +1,12 @@
+{
+  "listen_addr": ":8080",
+  "environment": "demo",
+  "region": "",
+  "account_type": "unified",
+  "api_key": "YOUR_BYBIT_API_KEY",
+  "api_secret": "YOUR_BYBIT_API_SECRET",
+  "password_hash": "$2a$12$REPLACE_WITH_BCRYPT_HASH",
+  "session_secret": "REPLACE_WITH_RANDOM_32_BYTES_HEX",
+  "session_ttl_hours": 24,
+  "cookie_insecure": true
+}

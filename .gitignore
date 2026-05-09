@@ -1,0 +1,6 @@
+config.json
+*.exe
+bybit-service
+genpass
+.idea/
+.vscode/
