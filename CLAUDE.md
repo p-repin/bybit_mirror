@@ -37,8 +37,10 @@ web/src/lib/api.ts          — login / logout / snapshot HTTP-клиент
 web/src/lib/store.svelte.ts — глобальный $state ($state-runes file), connectWS с auto-reconnect
 web/src/lib/types.ts        — типы Wallet/Position/Status/WSFrame, зеркало internal/hub/hub.go
 web/src/lib/mockSeed.ts     — dev-only: фейковые wallet+positions для UI-итераций
-web/src/lib/components/     — LoginScreen, Dashboard, AssetsTab, PositionsTab, StatusDot
+web/src/lib/components/     — LoginScreen, Dashboard, WalletSummary, AssetsTab, PositionsTab
 ```
+
+Модуль Go называется `github.com/p-repin/bybit_mirror` (см. `go.mod`). Все внутренние импорты — через этот префикс.
 
 ## Поток данных
 
@@ -158,23 +160,33 @@ npm run build
 - Bybit DTO маппятся в типы `hub.Wallet`/`hub.Position` напрямую — не плодить параллельных структур.
 - Без комментариев типа «что делает функция»; комментарий уместен только если объясняет неочевидное «почему».
 
-## Текущий статус (2026-05-09)
+## Текущий статус (2026-05-10)
 
 End-to-end pipeline проверен и работает. Юзер на Bybit EU (`testnet.bybit.eu`, `region: "eu"`). Реальный перевод USDC из Funding в Unified пролетел по WS-топику `wallet`, прилёг в hub, отображается в `/api/snapshot` и в UI.
 
-**Что сделано в этой сессии:**
+**Что сделано в предыдущей сессии (2026-05-09):**
 - Бэк: добавлено поле `region` (см. таблицу конфига); WS dial timeout с 15с до 8с (EU Akamai-edge флапает, retry-цикл с backoff 1→30с проскакивает за 2-3 попытки).
 - Фронт: скаффолд Vite + Svelte 5 + TS + Tailwind v4 + shadcn-style тёмная zinc-палитра + Geist шрифт. Две вкладки (Активы / Позиции), LoginScreen, реактивный $state-store с auto-reconnect WS, dev-only mock-сидер для UI-итераций.
 - В корне есть `check_key.py` (CCXT REST), `check_ws.py`/`check_ws_eu.py` (Python websockets) для повторной диагностики, если Bybit-сторона снова закапризничает.
 
+**Что сделано в этой сессии (2026-05-10):**
+- **Go-модуль переименован** в `github.com/p-repin/bybit_mirror` (был `bybit-service`); внутренние импорты в 7 файлах синхронизированы.
+- **Layout фронта**: новый компонент `WalletSummary.svelte` — единый rounded-card над вкладками, всегда виден независимо от активной вкладки. Total Equity (слева) и Unrealised PnL (справа) — крупно (`text-2xl sm:text-3xl`), Wallet Balance + Available — мелким подзаголовком. Дублирующая 4-карточная сетка из AssetsTab убрана.
+- **Header упрощён**: индикатор соединения (`StatusDot` + текст Connected/Reconnecting/Disconnected) удалён вместе с компонентом — оставлен только заголовок и кнопка Выйти; в демо-режиме рядом с заголовком мелкая подпись «Demo». Обрывы WS юзеру не показываем — auto-reconnect и так работает.
+- **Адаптив**:
+  - LoginScreen: `text-base sm:text-sm` на инпуте пароля — iOS Safari больше не зумит при фокусе (форма не «прыгает»).
+  - PositionsTab: на `< md` — карточки (символ + LONG/SHORT × leverage + крупный PnL сверху, сетка 2×2 с Размер/Margin/Avg/Mark + Liq.Price снизу). На `≥ md` — прежняя таблица.
+- **Vite-proxy**: в `web/vite.config.ts` подавлены `ECONNRESET` / `EPIPE` ошибки на WS-сокете (это нормальное закрытие при reconnect — раньше засирали dev-консоль).
+
 **Что НЕ проверено напрямую:**
-- WS-событие `position` — Bybit EU testnet требует KYC для разблокировки деривативов. Код-путь идентичен `wallet` (см. `internal/bybit/ws.go:147-162`), который работает. Проверится естественно, когда друг подключит mainnet-ключ.
+- WS-событие `position` — Bybit EU testnet требует KYC для разблокировки деривативов. Код-путь идентичен `wallet` (см. `internal/bybit/ws.go`), который работает. Проверится естественно, когда друг подключит mainnet-ключ.
 
 **Что дальше (открыто на следующую сессию):**
-1. Адаптив под мобилку/планшет: на `< 768px` — карточный вид для позиций вместо таблицы, скрытие неважных колонок (`hidden md:table-cell`), sticky-колонка «Символ» при горизонтальном скролле.
+1. Адаптив таблицы монет в `AssetsTab` (сейчас `overflow-auto` — на телефоне горизонтальный скролл). По образцу `PositionsTab`: `md:hidden` карточки + `hidden md:block` таблица.
 2. Cell-flash на апдейте (мигание ячейки при изменении PnL/цены — UX-приятность, как у бирж).
-3. Деплой: `npm run build` → `web/dist`, nginx-конфиг из секции «Деплой», systemd unit для Go-бинаря.
-4. Подключение mainnet-ключа друга — заменить `api_key`/`api_secret` в `config.json`, поставить `environment: "mainnet"` (и `region` под аккаунт).
+3. Retry-цикл для REST-снапшота на старте — сейчас одна попытка с 15с timeout, при флапе EU-edge снапшот молча роняется и пользователь видит пустой UI до первого WS-события. По образцу WS-реконнекта: 1с → 2с → ... → 30с, 3-4 попытки.
+4. Деплой: `npm run build` → `web/dist`, nginx-конфиг из секции «Деплой», systemd unit для Go-бинаря.
+5. Подключение mainnet-ключа друга — заменить `api_key`/`api_secret` в `config.json`, поставить `environment: "mainnet"` (и `region` под аккаунт).
 
 ## Возможные расширения (если попросят)
 
@@ -182,7 +194,7 @@ End-to-end pipeline проверен и работает. Юзер на Bybit EU
 - Фильтр категорий позиций на бэке (сейчас WS-топик `position` без фильтра — теоретически придут все, что подписывается под аккаунтом).
 - Rate limit на `/api/login` сверх bcrypt-задержки.
 - Username при логине, если потребуется отображать в UI / логах.
-- Адаптив фронта под мобилку (см. «Что дальше»).
+- Адаптив таблицы монет в AssetsTab под мобилку (см. «Что дальше»).
 - Cell-flash на апдейте (см. «Что дальше»).
 - Сортировка / фильтры в таблицах (по PnL, по размеру).
 - Тостеры/уведомления на ликвидацию или резкое движение PnL.

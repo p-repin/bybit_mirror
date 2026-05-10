@@ -6,7 +6,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"bybit-service/internal/hub"
+	"github.com/p-repin/bybit_mirror/internal/hub"
 )
 
 var upgrader = websocket.Upgrader{

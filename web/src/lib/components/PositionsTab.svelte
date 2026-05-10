@@ -12,14 +12,70 @@
   </div>
 {:else}
   <div class="rounded-xl border bg-card text-card-foreground shadow-sm">
-    <div class="flex flex-col space-y-1.5 p-6 pb-4">
+    <div class="flex flex-col space-y-1.5 p-4 sm:p-6 pb-4">
       <h3 class="text-base font-semibold leading-none tracking-tight">Открытые позиции</h3>
       <p class="text-sm text-muted-foreground">
         {app.positions.length}
         {app.positions.length === 1 ? "позиция" : "позиций"} активна
       </p>
     </div>
-    <div class="relative w-full overflow-auto">
+
+    <!-- Mobile: cards -->
+    <div class="md:hidden flex flex-col gap-px bg-border border-t">
+      {#each app.positions as p (p.category + p.symbol + p.positionIdx)}
+        {@const upnl = parseFloat(p.unrealisedPnl)}
+        {@const isLong = p.side === "Buy"}
+        <div class="bg-card p-4">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-2">
+              <span class="font-semibold text-base">{p.symbol}</span>
+              <span
+                class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium {isLong
+                  ? 'bg-[color:var(--up)]/15 text-[color:var(--up)]'
+                  : 'bg-[color:var(--down)]/15 text-[color:var(--down)]'}"
+              >
+                {isLong ? "LONG" : "SHORT"}
+                <span class="ml-1.5 text-muted-foreground font-normal">×{p.leverage}</span>
+              </span>
+            </div>
+            <div
+              class="num text-right font-semibold {upnl > 0
+                ? 'text-[color:var(--up)]'
+                : upnl < 0
+                  ? 'text-[color:var(--down)]'
+                  : 'text-muted-foreground'}"
+            >
+              {upnl > 0 ? "+" : ""}{fmtNum(upnl, 4)}
+            </div>
+          </div>
+          <div class="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
+            <div class="flex justify-between">
+              <span class="text-muted-foreground">Размер</span>
+              <span class="num">{fmtNum(p.size, 4)}</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-muted-foreground">Margin</span>
+              <span class="num">{fmtNum(p.positionValue, 2)}</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-muted-foreground">Avg</span>
+              <span class="num">{fmtNum(p.avgPrice, 2)}</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-muted-foreground">Mark</span>
+              <span class="num">{fmtNum(p.markPrice, 2)}</span>
+            </div>
+            <div class="flex justify-between col-span-2">
+              <span class="text-muted-foreground">Liq. Price</span>
+              <span class="num text-[color:var(--down)]">{fmtNum(p.liqPrice, 2)}</span>
+            </div>
+          </div>
+        </div>
+      {/each}
+    </div>
+
+    <!-- Desktop: table -->
+    <div class="hidden md:block relative w-full overflow-auto">
       <table class="w-full text-sm">
         <thead>
           <tr class="border-b text-muted-foreground">

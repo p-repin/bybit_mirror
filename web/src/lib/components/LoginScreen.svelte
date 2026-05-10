@@ -46,7 +46,7 @@
           id="pw"
           type="password"
           bind:value={password}
-          class="flex h-9 w-full rounded-md border bg-transparent px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground disabled:opacity-50"
+          class="flex h-9 w-full rounded-md border bg-transparent px-3 py-1 text-base sm:text-sm shadow-sm transition-colors placeholder:text-muted-foreground disabled:opacity-50"
           autocomplete="current-password"
           disabled={busy}
         />

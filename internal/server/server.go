@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"net/http"
 
-	"bybit-service/internal/auth"
-	"bybit-service/internal/hub"
+	"github.com/p-repin/bybit_mirror/internal/auth"
+	"github.com/p-repin/bybit_mirror/internal/hub"
 )
 
 type Server struct {

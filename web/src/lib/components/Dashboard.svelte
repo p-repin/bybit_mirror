@@ -4,7 +4,7 @@
   import { seedMock, clearMock } from "$lib/mockSeed";
   import AssetsTab from "./AssetsTab.svelte";
   import PositionsTab from "./PositionsTab.svelte";
-  import StatusDot from "./StatusDot.svelte";
+  import WalletSummary from "./WalletSummary.svelte";
 
   let { onLogout }: { onLogout: () => void } = $props();
 
@@ -48,23 +48,12 @@
   {/if}
 
   <header class="border-b">
-    <div class="mx-auto max-w-7xl flex h-14 items-center px-6">
+    <div class="mx-auto max-w-7xl flex h-14 items-center px-4 sm:px-6">
       <div class="flex items-center gap-6">
         <h1 class="text-base font-semibold tracking-tight">Bybit Mirror</h1>
-        <div class="flex items-center gap-2 text-sm text-muted-foreground">
-          <StatusDot connected={app.status.connected && app.wsConnected} />
-          <span>
-            {#if app.demo}
-              Demo
-            {:else if app.status.connected && app.wsConnected}
-              Connected
-            {:else if !app.wsConnected}
-              Reconnecting…
-            {:else}
-              {app.status.lastError || "Disconnected"}
-            {/if}
-          </span>
-        </div>
+        {#if app.demo}
+          <span class="text-sm text-muted-foreground">Demo</span>
+        {/if}
       </div>
       <div class="ml-auto flex items-center gap-2">
         {#if isDev && !app.demo}
@@ -84,8 +73,14 @@
         </button>
       </div>
     </div>
+  </header>
 
-    <div class="mx-auto max-w-7xl px-6">
+  <div class="mx-auto w-full max-w-7xl px-4 sm:px-6 pt-6">
+    <WalletSummary />
+  </div>
+
+  <div class="border-b mt-6">
+    <div class="mx-auto max-w-7xl px-4 sm:px-6">
       <nav class="flex gap-1 -mb-px">
         <button
           onclick={() => (activeTab = "assets")}
@@ -114,10 +109,10 @@
         </button>
       </nav>
     </div>
-  </header>
+  </div>
 
   <main class="flex-1">
-    <div class="mx-auto max-w-7xl px-6 py-6">
+    <div class="mx-auto max-w-7xl px-4 sm:px-6 py-6">
       {#if activeTab === "assets"}
         <AssetsTab />
       {:else}

@@ -16,6 +16,20 @@ export default defineConfig({
         target: 'http://localhost:8080',
         changeOrigin: true,
         ws: true,
+        configure: (proxy) => {
+          const isBenign = (err: NodeJS.ErrnoException) =>
+            err.code === 'ECONNRESET' || err.code === 'EPIPE'
+          proxy.on('error', (err) => {
+            if (isBenign(err)) return
+            console.error('[vite proxy]', err)
+          })
+          proxy.on('proxyReqWs', (_proxyReq, _req, socket) => {
+            socket.on('error', (err: NodeJS.ErrnoException) => {
+              if (isBenign(err)) return
+              console.error('[vite proxy ws]', err)
+            })
+          })
+        },
       },
     },
   },

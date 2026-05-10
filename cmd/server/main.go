@@ -11,11 +11,11 @@ import (
 	"syscall"
 	"time"
 
-	"bybit-service/internal/auth"
-	"bybit-service/internal/bybit"
-	"bybit-service/internal/config"
-	"bybit-service/internal/hub"
-	"bybit-service/internal/server"
+	"github.com/p-repin/bybit_mirror/internal/auth"
+	"github.com/p-repin/bybit_mirror/internal/bybit"
+	"github.com/p-repin/bybit_mirror/internal/config"
+	"github.com/p-repin/bybit_mirror/internal/hub"
+	"github.com/p-repin/bybit_mirror/internal/server"
 )
 
 func main() {

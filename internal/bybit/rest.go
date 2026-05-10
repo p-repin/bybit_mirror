@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"bybit-service/internal/hub"
+	"github.com/p-repin/bybit_mirror/internal/hub"
 )
 
 const recvWindow = "5000"

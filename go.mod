@@ -1,4 +1,4 @@
-module bybit-service
+module github.com/p-repin/bybit_mirror
 
 go 1.25.8
 

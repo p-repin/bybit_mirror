@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"bybit-service/internal/config"
-	"bybit-service/internal/hub"
+	"github.com/p-repin/bybit_mirror/internal/config"
+	"github.com/p-repin/bybit_mirror/internal/hub"
 )
 
 type Client struct {
