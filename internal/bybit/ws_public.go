@@ -166,40 +166,56 @@ func (c *WSPublicClient) send(v any) error {
 	return conn.WriteJSON(v)
 }
 
-// syncSubs шлёт sub/unsub по диффу desired vs active. Active обновляется
-// оптимистично — если сервер вернёт ошибку, увидим её в логах через
-// dispatch (op success=false), но повторно слать не пробуем: следующая
-// смена desired или реконнект всё перепошлют.
+// syncSubs шлёт sub/unsub по диффу desired vs active. c.active обновляется
+// **пессимистично** — символ помечается активным только после успешного send.
+// Раньше делали оптимистично, и если Bybit отвечал op=subscribe success=false
+// или send тихо проваливался, c.active навсегда залипал в неконсистентном
+// состоянии (claim'ит подписку, которой нет) — лечилось только реконнектом.
+// Симптом: новая позиция появлялась в стейте, но mark/PnL по ней не тикал
+// до перезапуска сервиса.
 func (c *WSPublicClient) syncSubs() {
 	c.mu.Lock()
 	var toSub, toUnsub []string
 	for s := range c.desired {
 		if _, ok := c.active[s]; !ok {
-			toSub = append(toSub, "tickers."+s)
+			toSub = append(toSub, s)
 		}
 	}
 	for s := range c.active {
 		if _, ok := c.desired[s]; !ok {
-			toUnsub = append(toUnsub, "tickers."+s)
+			toUnsub = append(toUnsub, s)
 		}
 	}
-	next := make(map[string]struct{}, len(c.desired))
-	for s := range c.desired {
-		next[s] = struct{}{}
-	}
-	c.active = next
 	c.mu.Unlock()
 
 	// Bybit лимитирует ~10 args на один op-сообщение.
 	for _, batch := range chunkArgs(toSub, 10) {
-		if err := c.send(map[string]any{"op": "subscribe", "args": batch}); err != nil {
+		args := make([]string, len(batch))
+		for i, s := range batch {
+			args[i] = "tickers." + s
+		}
+		if err := c.send(map[string]any{"op": "subscribe", "args": args}); err != nil {
 			return
 		}
+		c.mu.Lock()
+		for _, s := range batch {
+			c.active[s] = struct{}{}
+		}
+		c.mu.Unlock()
 	}
 	for _, batch := range chunkArgs(toUnsub, 10) {
-		if err := c.send(map[string]any{"op": "unsubscribe", "args": batch}); err != nil {
+		args := make([]string, len(batch))
+		for i, s := range batch {
+			args[i] = "tickers." + s
+		}
+		if err := c.send(map[string]any{"op": "unsubscribe", "args": args}); err != nil {
 			return
 		}
+		c.mu.Lock()
+		for _, s := range batch {
+			delete(c.active, s)
+		}
+		c.mu.Unlock()
 	}
 }
 
@@ -222,6 +238,7 @@ type pubMsg struct {
 	Topic   string          `json:"topic"`
 	Type    string          `json:"type"`
 	Op      string          `json:"op"`
+	Args    []string        `json:"args,omitempty"`
 	Success *bool           `json:"success,omitempty"`
 	RetMsg  string          `json:"ret_msg,omitempty"`
 	Data    json.RawMessage `json:"data"`
@@ -239,7 +256,19 @@ func (c *WSPublicClient) dispatch(raw []byte) {
 	}
 	if m.Op != "" {
 		if m.Success != nil && !*m.Success {
-			slog.Warn("bybit public ws op failed", "op", m.Op, "msg", m.RetMsg)
+			slog.Warn("bybit public ws op failed", "op", m.Op, "msg", m.RetMsg, "args", m.Args)
+			// Subscribe отказали — снимаем символы с c.active, чтобы следующий
+			// syncSubs повторил попытку. Без этого один rejected sub залипал
+			// бы до реконнекта (см. syncSubs про оптимистичный/пессимистичный
+			// апдейт). Args приходят с префиксом "tickers.", срезаем.
+			if m.Op == "subscribe" && len(m.Args) > 0 {
+				c.mu.Lock()
+				for _, a := range m.Args {
+					sym := strings.TrimPrefix(a, "tickers.")
+					delete(c.active, sym)
+				}
+				c.mu.Unlock()
+			}
 		}
 		return
 	}

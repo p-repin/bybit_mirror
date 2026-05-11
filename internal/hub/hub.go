@@ -214,6 +214,13 @@ func (h *Hub) ApplyPositions(positions []Position) {
 	h.mu.Lock()
 	before := symbolSet(h.state.Positions)
 	for _, p := range positions {
+		// WS-private дельта на новый символ может прийти без category — без
+		// неё key/Symbols фильтр отбросит позицию, public-WS никогда не
+		// подпишется на tickers.<sym> и mark не тикнет до рестарта сервиса
+		// (REST-снапшот тегает category из параметра запроса).
+		if p.Category == "" {
+			p.Category = categoryFromSymbol(p.Symbol)
+		}
 		k := p.key()
 		if p.Size == "0" {
 			delete(h.state.Positions, k)
@@ -344,76 +351,37 @@ func (h *Hub) ApplyMarkPrice(category, symbol, markPrice string) {
 	}
 }
 
-// settleCoinFromSymbol маппит linear-symbol → settle coin.
-// USDT-perp: BTCUSDT, ETHUSDT, ...
-// USDC-perp: BTCUSDC/ETHUSDC (новое именование) + BTCPERP/ETHPERP (старое).
-func settleCoinFromSymbol(symbol string) string {
-	if strings.HasSuffix(symbol, "USDT") {
-		return "USDT"
+// categoryFromSymbol — fallback когда Bybit WS-position дельта пришла с
+// пустым Category. Опционные символы у Bybit вида ETHUSDT-12MAY26-2325-C,
+// linear-перпы без дефиса. Inverse у нас не поддержан.
+func categoryFromSymbol(symbol string) string {
+	if strings.Contains(symbol, "-") {
+		return "option"
 	}
-	if strings.HasSuffix(symbol, "USDC") || strings.HasSuffix(symbol, "PERP") {
-		return "USDC"
-	}
-	return ""
+	return "linear"
 }
 
-// recomputeWalletLocked обновляет per-coin (USDT/USDC) unrealisedPnl и equity
-// исходя из текущего набора позиций, плюс агрегаты totalPerpUPL/totalEquity.
-// Wallet-топик Bybit event-driven, поэтому без этого верх UI замирает между
-// событиями. Должна вызываться под h.mu.Lock.
+// recomputeWalletLocked пересчитывает только totalPerpUPL по сумме UPL текущих
+// позиций. Остальные wallet-поля (totalEquity, coin.equity/usdValue/unrealisedPnl,
+// totalAvailableBalance, totalWalletBalance) — Bybit canonical и обновляются
+// через REST-полл /v5/account/wallet-balance (см. client.go::pollWallet).
+// Bybit считает их с учётом bonus / IM-локов / спот-цены не-стейбл монет —
+// реплицировать всё это локально нерально и расходится с приложением.
+// totalPerpUPL держим тикающим из позиций, чтобы шапка двигалась в такт mark-
+// апдейтам public-WS между REST-поллами. Должна вызываться под h.mu.Lock.
 func (h *Hub) recomputeWalletLocked() {
 	if h.state.Wallet == nil {
 		return
 	}
-	coinPnl := make(map[string]float64, 2)
+	var total float64
 	for _, p := range h.state.Positions {
-		settle := p.SettleCoin
-		if settle == "" {
-			settle = settleCoinFromSymbol(p.Symbol)
-		}
-		if settle == "" {
-			continue
-		}
 		pnl, err := strconv.ParseFloat(p.UnrealisedPnl, 64)
 		if err != nil {
 			continue
 		}
-		coinPnl[settle] += pnl
+		total += pnl
 	}
-	newCoins := make([]Coin, len(h.state.Wallet.Coins))
-	copy(newCoins, h.state.Wallet.Coins)
-	for i := range newCoins {
-		c := &newCoins[i]
-		pnl, ok := coinPnl[c.Coin]
-		if !ok {
-			continue
-		}
-		c.UnrealisedPnl = strconv.FormatFloat(pnl, 'f', -1, 64)
-		wb, err := strconv.ParseFloat(c.WalletBalance, 64)
-		if err != nil {
-			continue
-		}
-		equity := wb + pnl
-		c.Equity = strconv.FormatFloat(equity, 'f', -1, 64)
-		// Для USDT/USDC usdValue 1:1 c equity. Для других монет (BTC, ETH в кошельке)
-		// usdValue требует спот-цены — оставляем как было от Bybit.
-		if c.Coin == "USDT" || c.Coin == "USDC" {
-			c.UsdValue = strconv.FormatFloat(equity, 'f', -1, 64)
-		}
-	}
-	h.state.Wallet.Coins = newCoins
-
-	var totalUPL, totalEquity float64
-	for _, c := range newCoins {
-		if pnl, err := strconv.ParseFloat(c.UnrealisedPnl, 64); err == nil {
-			totalUPL += pnl
-		}
-		if usd, err := strconv.ParseFloat(c.UsdValue, 64); err == nil {
-			totalEquity += usd
-		}
-	}
-	h.state.Wallet.TotalPerpUPL = strconv.FormatFloat(totalUPL, 'f', -1, 64)
-	h.state.Wallet.TotalEquity = strconv.FormatFloat(totalEquity, 'f', -1, 64)
+	h.state.Wallet.TotalPerpUPL = strconv.FormatFloat(total, 'f', -1, 64)
 }
 
 // Bybit WS-дельты не всегда несут все поля: неизменившиеся приходят

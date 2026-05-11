@@ -41,6 +41,8 @@ func (c *Client) Run(ctx context.Context) {
 	c.wsLin.SetSymbols(c.hub.Symbols("linear"))
 	c.wsOpt.SetSymbols(c.hub.Symbols("option"))
 	go c.pollMarginMode(ctx)
+	go c.pollWallet(ctx)
+	go c.pollPositions(ctx)
 	go c.wsLin.Run(ctx)
 	go c.wsOpt.Run(ctx)
 	c.ws.Run(ctx)
@@ -91,6 +93,88 @@ func (c *Client) snapshot(ctx context.Context) {
 	}
 	if len(positions) > 0 {
 		c.hub.ApplyPositions(positions)
+	}
+}
+
+// WS-wallet топик event-driven (фил, funding, leverage change) — не пушит
+// per-tick UPL по mark'у, не учитывает Bybit-овский bonus / IM-локи / спот-цену
+// не-стейбл монет. Поэтому шапку (totalEquity, coin.equity/usdValue) считаем
+// не сами, а тянем REST raz в 2с — Bybit там отдаёт каноничные числа,
+// сходящиеся с приложением. totalPerpUPL продолжаем пересчитывать в hub из
+// текущих позиций, чтобы шапка тикала вместе с mark-апдейтами public-WS.
+func (c *Client) pollWallet(ctx context.Context) {
+	accountType := "UNIFIED"
+	if c.cfg.AccountType == config.AccountClassic {
+		accountType = "CONTRACT"
+	}
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			w, err := c.rst.WalletBalance(rctx, accountType)
+			cancel()
+			if err != nil {
+				slog.Warn("poll wallet failed", "err", err)
+				continue
+			}
+			if w != nil {
+				c.hub.ApplyWallet(*w)
+			}
+		}
+	}
+}
+
+// pollPositions — safety-net поверх WS-private + public-WS. Раз в 10с
+// перечитывает все 4 (linear/USDT, linear/USDC, option/USDT, option/USDC),
+// зовёт ApplyPositions и в конце унконсиционно пинает SetSymbols на обоих
+// public-стримах. Это закрывает несколько углов:
+//  1. WS-private может прислать position-дельту с пустым category — наш
+//     fallback по символу не 100% (вдруг inverse или странный символ);
+//     REST всегда тегает category из контекста запроса.
+//  2. Public-WS subscribe может быть отвергнут Bybit'ом (success=false);
+//     dispatch снимает символ с active, и принудительный SetSymbols здесь
+//     триггерит resub.
+//  3. Bybit-овский liqPrice/PnL/avgPrice как baseline между WS-событиями.
+func (c *Client) pollPositions(ctx context.Context) {
+	queries := []struct {
+		category, settle string
+	}{
+		{"linear", "USDT"},
+		{"linear", "USDC"},
+		{"option", "USDT"},
+		{"option", "USDC"},
+	}
+	t := time.NewTicker(10 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			var positions []hub.Position
+			for _, q := range queries {
+				ps, err := c.rst.Positions(rctx, q.category, q.settle)
+				if err != nil {
+					slog.Warn("poll positions failed",
+						"category", q.category, "settle", q.settle, "err", err)
+					continue
+				}
+				positions = append(positions, ps...)
+			}
+			cancel()
+			if len(positions) > 0 {
+				c.hub.ApplyPositions(positions)
+			}
+			// Принудительный пинок public-WS: если что-то отвалилось, syncSubs
+			// сейчас увидит расхождение desired vs active и пересубается.
+			c.wsLin.SetSymbols(c.hub.Symbols("linear"))
+			c.wsOpt.SetSymbols(c.hub.Symbols("option"))
+		}
 	}
 }
 
