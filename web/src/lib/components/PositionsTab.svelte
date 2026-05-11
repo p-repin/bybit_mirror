@@ -1,6 +1,22 @@
 <script lang="ts">
   import { app } from "$lib/store.svelte";
   import { fmtNum } from "$lib/utils";
+
+  // Bybit-app показывает Cross/Isolated на основе account-level marginMode,
+  // а не per-position tradeMode. tradeMode в UTA cross почти всегда 0,
+  // даже если в app переключено на Isolated.
+  const marginLabel = $derived.by(() => {
+    switch (app.wallet?.marginMode) {
+      case "ISOLATED_MARGIN":
+        return "iso";
+      case "REGULAR_MARGIN":
+        return "cross";
+      case "PORTFOLIO_MARGIN":
+        return "portfolio";
+      default:
+        return null;
+    }
+  });
 </script>
 
 {#if app.positions.length === 0}
@@ -35,7 +51,12 @@
                   : 'bg-[color:var(--down)]/15 text-[color:var(--down)]'}"
               >
                 {isLong ? "LONG" : "SHORT"}
-                <span class="ml-1.5 text-muted-foreground font-normal">×{p.leverage}</span>
+                {#if p.leverage && p.leverage !== "0"}
+                  <span class="ml-1.5 text-muted-foreground font-normal">×{p.leverage}</span>
+                {/if}
+                {#if marginLabel}
+                  <span class="ml-1.5 text-muted-foreground font-normal">{marginLabel}</span>
+                {/if}
               </span>
             </div>
             <div
@@ -102,7 +123,12 @@
                     : 'bg-[color:var(--down)]/15 text-[color:var(--down)]'}"
                 >
                   {isLong ? "LONG" : "SHORT"}
-                  <span class="ml-1.5 text-muted-foreground font-normal">×{p.leverage}</span>
+                  {#if p.leverage && p.leverage !== "0"}
+                    <span class="ml-1.5 text-muted-foreground font-normal">×{p.leverage}</span>
+                  {/if}
+                  {#if marginLabel}
+                    <span class="ml-1.5 text-muted-foreground font-normal">{marginLabel}</span>
+                  {/if}
                 </span>
               </td>
               <td class="px-4 py-3 num text-right">{fmtNum(p.size, 4)}</td>

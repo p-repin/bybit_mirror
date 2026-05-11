@@ -1,0 +1,28 @@
+[Unit]
+Description=Bybit Mirror — read-only account dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bybit
+Group=bybit
+WorkingDirectory=/opt/bybit-mirror
+ExecStart=/opt/bybit-mirror/bybit-mirror -config /etc/bybit-mirror/config.json
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+ReadOnlyPaths=/etc/bybit-mirror
+
+[Install]
+WantedBy=multi-user.target

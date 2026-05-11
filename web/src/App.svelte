@@ -22,6 +22,8 @@
       } else {
         bootError = msg;
       }
+    } finally {
+      app.booting = false;
     }
   }
 
@@ -54,7 +56,9 @@
   onMount(tryBoot);
 </script>
 
-{#if app.authed}
+{#if app.booting}
+  <div class="min-h-screen"></div>
+{:else if app.authed}
   <Dashboard onLogout={handleLogout} />
 {:else}
   <LoginScreen onLogin={handleLogin} onDemo={handleDemo} {bootError} />

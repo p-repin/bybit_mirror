@@ -127,14 +127,29 @@ npm run dev
 
 ## Запуск в проде
 
-Подробности — в `CLAUDE.md`, секция «Деплой». Кратко:
+В `deploy/` лежат готовые артефакты:
+
+- `bybit-mirror.service` — systemd unit с hardening (юзер `bybit`, `ProtectSystem=strict`).
+- `bybit-mirror.nginx` — server-block: TLS на 443 (Cloudflare Origin Cert), 80→443 редирект, проксирование `/api/*` на `127.0.0.1:8080`, раздача SPA из `/var/www/bybit-front`, антииндексация (`X-Robots-Tag`, `robots.txt`), `map $http_upgrade $connection_upgrade` для WS.
+
+Cross-compile под Linux/amd64 и сборка фронта:
 
 ```powershell
-go build -o bybit-server ./cmd/server   # статичный бинарь
-cd web && npm run build                  # статика → web/dist/
+$env:GOOS="linux"; $env:GOARCH="amd64"; $env:CGO_ENABLED="0"
+go build -o build/bybit-mirror ./cmd/server
+Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED
+
+cd web; npm run build; cd ..
 ```
 
-Дальше: nginx раздаёт `web/dist`, проксирует `/api/*` на `127.0.0.1:8080`. Go-бинарь крутится через systemd unit (Linux) или Windows Service. В nginx-конфиге обязательно `proxy_set_header Upgrade $http_upgrade` и `Connection "upgrade"` — без этого WebSocket не пройдёт.
+Дальше заливаешь бинарь в `/opt/bybit-mirror/`, `dist/` в `/var/www/bybit-front/`, ставишь systemd unit и nginx-конфиг, перезапускаешь сервисы. На стороне TLS два варианта:
+
+- **Cloudflare-фронт + Origin Cert** (как в проде проекта) — серт берётся в Cloudflare-дашборде (SSL/TLS → Origin Server → Create Certificate), кладётся в `/etc/ssl/{certs,private}/`. На стороне Cloudflare включаются `Proxied`-DNS, `Full (strict)` SSL/TLS mode и WebSockets. Бонус: DDoS-защита, скрытый origin-IP, бесплатный публичный TLS.
+- **Let's Encrypt напрямую** — `apt install certbot python3-certbot-nginx`, `certbot --nginx -d твой-домен`, дальше cron-обновление сам пропишет. Тут DNS должна указывать прямо на VPS, без Cloudflare-прокси.
+
+Дополнительная защита origin'а — `ufw` ограничивает 80/443 диапазонами Cloudflare (если используешь его в качестве фронта), список тянется с `cloudflare.com/ips-v4` и `/ips-v6` cron-скриптом.
+
+Подробности по архитектуре и потоку данных — в `CLAUDE.md`.
 
 ---
 
@@ -161,6 +176,12 @@ Cookie живёт 24 часа (настраивается `session_ttl_hours` в
 
 ### Мобилка / планшет
 Сводный блок (Total Equity / Unrealised PnL + Wallet Balance / Available) и вкладка «Позиции» адаптированы под телефон: позиции на узких экранах рендерятся карточками, без горизонтального скролла. Логин-форма не зумится при фокусе пароля. Таблица «Активы → Монеты» пока остаётся со скроллом (5 колонок, в TODO).
+
+### Cross / Isolated в UI
+Под бейджем LONG/SHORT × leverage мелким шрифтом выводится `cross` / `iso` / `portfolio`. Берётся из **account-level marginMode** (REST `/v5/account/info`, poll каждые 30с), а не из per-position `tradeMode` — потому что в UTA cross эти два значения часто расходятся, а Bybit-app показывает именно account-level. Переключение в Bybit-app отражается в UI в пределах 30 секунд.
+
+### Активная вкладка при F5
+Запоминается в `localStorage` (`bybit-mirror.active-tab`) — куда ушёл, там и останешься. Параллельно при загрузке страница пустая, пока не проверится авторизация, чтобы не мигало окно логина перед dashboard.
 
 ### Безопасность
 - Пароль защищён bcrypt (cost=12, ~250ms на проверку — это де-факто rate limit).
@@ -194,5 +215,6 @@ Cookie живёт 24 часа (настраивается `session_ttl_hours` в
 - Cell-flash на изменении PnL/цены (мигание ячейки, как у бирж)
 - Сортировка/фильтры в таблицах
 - Тостеры/уведомления при ликвидации или резком движении PnL
+- UI настроек: смена API-ключей через дашборд (сейчас — `ssh` + правка `config.json` + рестарт)
 
 Полный список — в `CLAUDE.md` → «Возможные расширения».

@@ -103,6 +103,29 @@ type positionResp struct {
 	} `json:"result"`
 }
 
+type accountInfoResp struct {
+	RetCode int    `json:"retCode"`
+	RetMsg  string `json:"retMsg"`
+	Result  struct {
+		MarginMode string `json:"marginMode"`
+	} `json:"result"`
+}
+
+func (c *RESTClient) AccountInfo(ctx context.Context) (string, error) {
+	body, err := c.signedGET(ctx, "/v5/account/info", url.Values{})
+	if err != nil {
+		return "", err
+	}
+	var r accountInfoResp
+	if err := json.Unmarshal(body, &r); err != nil {
+		return "", err
+	}
+	if r.RetCode != 0 {
+		return "", fmt.Errorf("bybit account info retCode=%d msg=%s", r.RetCode, r.RetMsg)
+	}
+	return r.Result.MarginMode, nil
+}
+
 func (c *RESTClient) Positions(ctx context.Context, category, settleCoin string) ([]hub.Position, error) {
 	var all []hub.Position
 	cursor := ""

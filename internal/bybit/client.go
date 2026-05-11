@@ -27,6 +27,7 @@ func NewClient(cfg *config.Config, h *hub.Hub) *Client {
 
 func (c *Client) Run(ctx context.Context) {
 	c.snapshot(ctx)
+	go c.pollMarginMode(ctx)
 	c.ws.Run(ctx)
 }
 
@@ -38,6 +39,14 @@ func (c *Client) snapshot(ctx context.Context) {
 	if c.cfg.AccountType == config.AccountClassic {
 		accountType = "CONTRACT"
 	}
+
+	// marginMode тащим первым, чтобы при ApplyWallet оно сразу было в hub
+	if mode, err := c.rst.AccountInfo(sctx); err != nil {
+		slog.Warn("initial account info failed", "err", err)
+	} else if mode != "" {
+		c.hub.ApplyMarginMode(mode)
+	}
+
 	if w, err := c.rst.WalletBalance(sctx, accountType); err != nil {
 		slog.Warn("initial wallet snapshot failed", "err", err)
 	} else if w != nil {
@@ -55,5 +64,29 @@ func (c *Client) snapshot(ctx context.Context) {
 	}
 	if len(positions) > 0 {
 		c.hub.ApplyPositions(positions)
+	}
+}
+
+// Bybit не шлёт изменение marginMode в WS — поэтому пуллим REST раз в 30с,
+// чтобы переключение Cross↔Isolated в Bybit-app отображалось у нас в UI.
+func (c *Client) pollMarginMode(ctx context.Context) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			mode, err := c.rst.AccountInfo(rctx)
+			cancel()
+			if err != nil {
+				slog.Warn("poll account info failed", "err", err)
+				continue
+			}
+			if mode != "" {
+				c.hub.ApplyMarginMode(mode)
+			}
+		}
 	}
 }

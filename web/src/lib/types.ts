@@ -18,6 +18,7 @@ export interface Wallet {
   totalMarginBalance: string;
   totalPerpUPL: string;
   coin: WalletCoin[];
+  marginMode?: string;
 }
 
 export interface Position {
@@ -33,6 +34,7 @@ export interface Position {
   liqPrice: string;
   markPrice: string;
   positionIdx: number;
+  tradeMode?: number;
   takeProfit: string;
   stopLoss: string;
   trailingStop: string;

@@ -9,7 +9,21 @@
   let { onLogout }: { onLogout: () => void } = $props();
 
   type Tab = "assets" | "positions";
-  let activeTab: Tab = $state("assets");
+  const TAB_KEY = "bybit-mirror.active-tab";
+
+  function readTab(): Tab {
+    if (typeof window === "undefined") return "assets";
+    const stored = window.localStorage.getItem(TAB_KEY);
+    return stored === "positions" ? "positions" : "assets";
+  }
+
+  let activeTab: Tab = $state(readTab());
+
+  $effect(() => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(TAB_KEY, activeTab);
+    }
+  });
 
   const isDev = import.meta.env.DEV;
   let mockOn = $state(false);

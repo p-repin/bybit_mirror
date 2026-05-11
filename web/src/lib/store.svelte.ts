@@ -7,6 +7,7 @@ type AppState = {
   authed: boolean;
   wsConnected: boolean;
   demo: boolean;
+  booting: boolean;
 };
 
 export const app: AppState = $state({
@@ -16,6 +17,9 @@ export const app: AppState = $state({
   authed: false,
   wsConnected: false,
   demo: false,
+  // booting=true пока tryBoot не определил, авторизован ли юзер.
+  // Без этого при F5 на доли секунды показывался экран логина.
+  booting: true,
 });
 
 let ws: WebSocket | null = null;

@@ -24,6 +24,9 @@ type Wallet struct {
 	TotalMarginBalance    string `json:"totalMarginBalance"`
 	TotalPerpUPL          string `json:"totalPerpUPL"`
 	Coins                 []Coin `json:"coin"`
+	// MarginMode тянется из /v5/account/info (отдельный REST), а не приходит
+	// в WS-wallet топике — сохраняем при перезаписи Wallet, см. ApplyWallet.
+	MarginMode string `json:"marginMode,omitempty"`
 }
 
 type Position struct {
@@ -38,8 +41,11 @@ type Position struct {
 	LiqPrice       string `json:"liqPrice"`
 	PositionValue  string `json:"positionValue"`
 	Leverage       string `json:"leverage"`
-	Category       string `json:"category"`
-	UpdatedTime    string `json:"updatedTime"`
+	// TradeMode: 0 = cross, 1 = isolated. Указатель — чтобы отличить
+	// «не пришло в WS-дельте» (nil) от «реально 0=cross».
+	TradeMode   *int   `json:"tradeMode,omitempty"`
+	Category    string `json:"category"`
+	UpdatedTime string `json:"updatedTime"`
 }
 
 func (p Position) key() string {
@@ -143,7 +149,22 @@ func (h *Hub) Unregister(c *Client) {
 
 func (h *Hub) ApplyWallet(w Wallet) {
 	h.mu.Lock()
+	if w.MarginMode == "" && h.state.Wallet != nil {
+		w.MarginMode = h.state.Wallet.MarginMode
+	}
 	h.state.Wallet = &w
+	h.mu.Unlock()
+	h.broadcast(Envelope{Type: "wallet", Data: w})
+}
+
+func (h *Hub) ApplyMarginMode(mode string) {
+	h.mu.Lock()
+	if h.state.Wallet == nil || h.state.Wallet.MarginMode == mode {
+		h.mu.Unlock()
+		return
+	}
+	h.state.Wallet.MarginMode = mode
+	w := *h.state.Wallet
 	h.mu.Unlock()
 	h.broadcast(Envelope{Type: "wallet", Data: w})
 }
@@ -182,6 +203,10 @@ func mergePosition(old, upd Position) Position {
 		}
 		return n
 	}
+	tradeMode := old.TradeMode
+	if upd.TradeMode != nil {
+		tradeMode = upd.TradeMode
+	}
 	return Position{
 		Symbol:         pick(upd.Symbol, old.Symbol),
 		Side:           pick(upd.Side, old.Side),
@@ -194,6 +219,7 @@ func mergePosition(old, upd Position) Position {
 		LiqPrice:       pick(upd.LiqPrice, old.LiqPrice),
 		PositionValue:  pick(upd.PositionValue, old.PositionValue),
 		Leverage:       pick(upd.Leverage, old.Leverage),
+		TradeMode:      tradeMode,
 		Category:       pick(upd.Category, old.Category),
 		UpdatedTime:    pick(upd.UpdatedTime, old.UpdatedTime),
 	}

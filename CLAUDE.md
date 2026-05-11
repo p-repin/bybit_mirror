@@ -10,11 +10,16 @@
 Bybit private WS ──┐
                    ├──► hub (in-memory state) ──► browser clients (WS)
 Bybit REST (init) ─┘                          └─► /api/snapshot (HTTP)
+        ▲
+        └── pollMarginMode каждые 30с (account-level marginMode)
 ```
 
 - Один процесс держит одно WS-соединение с Bybit и реплицирует его всем браузерным клиентам.
 - Стейт никогда не персистится — это «зеркало» текущего состояния аккаунта.
-- На старте делается REST-снапшот (`wallet-balance` + `position/list` для linear USDT/USDC), затем подписка на WS-топики `wallet` и `position` приносит дельты.
+- На старте делается REST-снапшот (`account/info` для marginMode + `wallet-balance` + `position/list` для linear USDT/USDC), затем подписка на WS-топики `wallet` и `position` приносит дельты.
+- Параллельно горутина `pollMarginMode` каждые 30с дёргает `/v5/account/info` — Bybit не шлёт изменение marginMode (Cross↔Isolated на уровне аккаунта) через WS, и без поллинга UI не подхватывал бы переключение в Bybit-app.
+
+В проде сервис стоит за **Cloudflare Origin Cert** (nginx → 127.0.0.1:8080), origin закрыт firewall'ом для всего трафика кроме CF edge-диапазонов. Подробности — в `deploy/` и `DEPLOY.local.md` (gitignored, у владельца инстанса).
 
 ## Карта кода
 
@@ -24,20 +29,30 @@ cmd/server/main.go          — точка входа: load config → hub → b
 internal/config/config.go   — JSON-конфиг и его валидация
 internal/auth/auth.go       — bcrypt-проверка + HMAC-подписанный stateless cookie
 internal/bybit/sign.go      — HMAC-SHA256 (для REST-подписи и WS-auth)
-internal/bybit/rest.go      — RESTClient: WalletBalance, Positions (с пагинацией)
+internal/bybit/rest.go      — RESTClient: AccountInfo, WalletBalance, Positions (с пагинацией)
 internal/bybit/ws.go        — WSClient: dial, auth, subscribe, ping/20s, reconnect 1→30s
-internal/bybit/client.go    — оркестратор: REST snapshot → WS Run
+internal/bybit/client.go    — оркестратор: REST snapshot → pollMarginMode goroutine → WS Run
 internal/server/server.go   — http-роуты, login/logout/snapshot
 internal/server/ws.go       — апгрейд /api/ws, ping/30s, pong-deadline 70s
-internal/hub/hub.go         — состояние (Wallet, Positions map, Status), broadcast клиентам
+internal/hub/hub.go         — состояние (Wallet, Positions map, Status); потокобезопасно;
+                              mergePosition сохраняет старые поля при WS-дельтах с пустыми значениями;
+                              ApplyMarginMode/ApplyWallet защищают marginMode от затирания WS-снапшотом
 
 web/                        — Svelte 5 + Vite + Tailwind v4 (shadcn-стиль)
-web/src/App.svelte          — root: tryBoot → snapshot/login routing
+web/src/App.svelte          — root: tryBoot → snapshot/login routing; app.booting гасит мигание формы при F5
 web/src/lib/api.ts          — login / logout / snapshot HTTP-клиент
 web/src/lib/store.svelte.ts — глобальный $state ($state-runes file), connectWS с auto-reconnect
 web/src/lib/types.ts        — типы Wallet/Position/Status/WSFrame, зеркало internal/hub/hub.go
 web/src/lib/mockSeed.ts     — dev-only: фейковые wallet+positions для UI-итераций
-web/src/lib/components/     — LoginScreen, Dashboard, WalletSummary, AssetsTab, PositionsTab
+web/src/lib/components/     — LoginScreen, Dashboard (activeTab → localStorage), WalletSummary, AssetsTab, PositionsTab
+
+deploy/                     — артефакты для прод-инсталляции
+deploy/bybit-mirror.service — systemd unit, User=bybit, ProtectSystem=strict, ReadOnlyPaths=/etc/bybit-mirror
+deploy/bybit-mirror.nginx   — server-block: TLS на 443 (Cloudflare Origin Cert),
+                              redirect 80→443, X-Robots-Tag/Referrer-Policy/X-Content-Type-Options,
+                              robots.txt через `location = /robots.txt`,
+                              map $http_upgrade $connection_upgrade в самом файле (попадает в http через sites-enabled)
+deploy/nginx-connection-upgrade.conf — отдельный map-файл для conf.d-style nginx-сборок (не используется в текущем деплое)
 ```
 
 Модуль Go называется `github.com/p-repin/bybit_mirror` (см. `go.mod`). Все внутренние импорты — через этот префикс.
@@ -51,11 +66,16 @@ web/src/lib/components/     — LoginScreen, Dashboard, WalletSummary, AssetsTab
    - запускает `bybit.Client.Run(ctx)` в горутине,
    - запускает `http.Server`.
 2. `bybit.Client.Run`:
-   - сначала `snapshot()` — REST-вызовы `/v5/account/wallet-balance` и `/v5/position/list` (linear, settleCoin=USDT и USDC), результат заливается в hub через `ApplyWallet` / `ApplyPositions`,
+   - сначала `snapshot()` — REST-вызовы `/v5/account/info` (marginMode), `/v5/account/wallet-balance`, `/v5/position/list` (linear, settleCoin=USDT и USDC). Результат заливается в hub через `ApplyMarginMode` / `ApplyWallet` / `ApplyPositions`.
+   - параллельно стартует `pollMarginMode` — горутина с тикером 30с, дёргает `/v5/account/info` и вызывает `ApplyMarginMode` если значение изменилось (no-op + no broadcast если то же).
    - потом `WSClient.Run` — бесконечный цикл с реконнектом и backoff'ом.
 3. WS-сообщения от Bybit разбираются в `WSClient.dispatch`:
-   - `topic=wallet` → `hub.ApplyWallet` (полная замена) → broadcast `{type:"wallet"}`,
-   - `topic=position` → `hub.ApplyPositions` (мердж в map по ключу `category|symbol|positionIdx`, удаление при `size=="0"`) → broadcast `{type:"positions"}`,
+   - `topic=wallet` → `hub.ApplyWallet` (перезапись, но `marginMode` сохраняется из старого Wallet если в новом пусто — WS-wallet топик не несёт marginMode) → broadcast `{type:"wallet"}`,
+   - `topic=position` → `hub.ApplyPositions`. Для каждой позиции из дельты:
+     - `size == "0"` → удаляем из map по ключу `category|symbol|positionIdx`;
+     - позиция уже в map → `mergePosition`: пустые поля в дельте сохраняют старые значения (Bybit шлёт неизменившиеся поля как `""`, иначе их затирали бы);
+     - новой позиции с пустым size — игнорируем (partial update без known позиции).
+     Broadcast `{type:"positions"}`.
    - сервисные ответы `op=auth/subscribe/pong` логируются если `success=false`.
 4. Браузер коннектится на `/api/ws`:
    - `hub.Register` сразу шлёт `{type:"snapshot", data:{wallet, positions, status}}`,
@@ -76,6 +96,10 @@ WebSocket-фрейм всегда:
 ```
 
 Структуры `Wallet`, `Position`, `Status` — см. `internal/hub/hub.go`. JSON-теги повторяют поля v5 Bybit API один-в-один, поэтому десериализация WS-данных идёт прямо в эти типы.
+
+**Wallet** имеет ещё поле `MarginMode string \`json:"marginMode,omitempty"\`` — оно не из Bybit-wallet-payload'а, а из `/v5/account/info`. UI рисует Cross/Isolated/Portfolio по этому полю (account-level), а не по `Position.TradeMode` (per-position). В UTA cross-аккаунте `TradeMode` почти всегда `0` независимо от того, что показывает Bybit-app, поэтому за визуальный режим отвечает `marginMode`.
+
+**Position.TradeMode** — `*int` (указатель), чтобы `mergePosition` мог отличить «не пришло в дельте» (nil) от «реально 0». Сейчас в UI не используется, но поле сохраняется в payload для будущего расширения (если кто-то реально откроет per-position-isolated).
 
 ## Конфиг
 
@@ -105,24 +129,24 @@ WebSocket-фрейм всегда:
 
 ## Деплой
 
-Сервис рассчитан жить за **nginx reverse proxy на том же origin**:
+Готовые артефакты лежат в `deploy/`. Базовая схема — **за Cloudflare-прокси с Origin Certificate**:
 
-```nginx
-location /api/ {
-    proxy_pass http://127.0.0.1:8080;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection $connection_upgrade;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-}
-location / {
-    root /var/www/bybit-front;
-    try_files $uri /index.html;
-}
+```
+Browser ──[Cloudflare Universal SSL]──► Cloudflare Edge ──[Origin Cert TLS]──► VPS:443 (nginx)
+                                                                                    │
+                                                                          /api/* → 127.0.0.1:8080
+                                                                          /     → /var/www/bybit-front
 ```
 
-`upgrader.CheckOrigin` сейчас возвращает `true` — фильтрация origin делается на nginx.
+- nginx на 443 предъявляет **Cloudflare Origin Cert** (15-летний серт, валидный только для Cloudflare; публичные браузеры его не видят — они подключаются к Cloudflare Universal SSL).
+- 80 → 301 на 443.
+- `map $http_upgrade $connection_upgrade` лежит в `deploy/bybit-mirror.nginx` на верхнем уровне файла — попадает в `http`-контекст через `include sites-enabled/*`.
+- Анти-индексация многослойно: `<meta name="robots">` в `index.html`, `X-Robots-Tag` HTTP-хедер, `/robots.txt` через `location =`-блок прямо в nginx.
+- Origin-firewall: 80/443 пускают **только** Cloudflare-диапазоны (ufw + cron-скрипт `update-cf-ufw.sh` обновляет список раз в неделю).
+- systemd unit с hardening (`NoNewPrivileges`, `ProtectSystem=strict`, `ReadOnlyPaths=/etc/bybit-mirror`, юзер `bybit`).
+- `upgrader.CheckOrigin` возвращает `true` — фильтрация origin делается на nginx (за Cloudflare его как такового нет).
+
+Конкретные команды деплоя/отката для текущего инстанса — в `DEPLOY.local.md` (gitignored, у владельца).
 
 ## Команды
 
@@ -160,33 +184,36 @@ npm run build
 - Bybit DTO маппятся в типы `hub.Wallet`/`hub.Position` напрямую — не плодить параллельных структур.
 - Без комментариев типа «что делает функция»; комментарий уместен только если объясняет неочевидное «почему».
 
-## Текущий статус (2026-05-10)
+## Текущий статус (2026-05-11)
 
-End-to-end pipeline проверен и работает. Юзер на Bybit EU (`testnet.bybit.eu`, `region: "eu"`). Реальный перевод USDC из Funding в Unified пролетел по WS-топику `wallet`, прилёг в hub, отображается в `/api/snapshot` и в UI.
+Прод-инсталляция запущена и работает: домен `bb-mirror.com` через Cloudflare с Origin Certificate, mainnet API-ключи друга, end-to-end pipeline проверен (wallet, positions, marginMode подтягиваются и отображаются корректно).
 
-**Что сделано в предыдущей сессии (2026-05-09):**
-- Бэк: добавлено поле `region` (см. таблицу конфига); WS dial timeout с 15с до 8с (EU Akamai-edge флапает, retry-цикл с backoff 1→30с проскакивает за 2-3 попытки).
-- Фронт: скаффолд Vite + Svelte 5 + TS + Tailwind v4 + shadcn-style тёмная zinc-палитра + Geist шрифт. Две вкладки (Активы / Позиции), LoginScreen, реактивный $state-store с auto-reconnect WS, dev-only mock-сидер для UI-итераций.
-- В корне есть `check_key.py` (CCXT REST), `check_ws.py`/`check_ws_eu.py` (Python websockets) для повторной диагностики, если Bybit-сторона снова закапризничает.
+**Что сделано в этой сессии (2026-05-11):**
 
-**Что сделано в этой сессии (2026-05-10):**
-- **Go-модуль переименован** в `github.com/p-repin/bybit_mirror` (был `bybit-service`); внутренние импорты в 7 файлах синхронизированы.
-- **Layout фронта**: новый компонент `WalletSummary.svelte` — единый rounded-card над вкладками, всегда виден независимо от активной вкладки. Total Equity (слева) и Unrealised PnL (справа) — крупно (`text-2xl sm:text-3xl`), Wallet Balance + Available — мелким подзаголовком. Дублирующая 4-карточная сетка из AssetsTab убрана.
-- **Header упрощён**: индикатор соединения (`StatusDot` + текст Connected/Reconnecting/Disconnected) удалён вместе с компонентом — оставлен только заголовок и кнопка Выйти; в демо-режиме рядом с заголовком мелкая подпись «Demo». Обрывы WS юзеру не показываем — auto-reconnect и так работает.
-- **Адаптив**:
-  - LoginScreen: `text-base sm:text-sm` на инпуте пароля — iOS Safari больше не зумит при фокусе (форма не «прыгает»).
-  - PositionsTab: на `< md` — карточки (символ + LONG/SHORT × leverage + крупный PnL сверху, сетка 2×2 с Размер/Margin/Avg/Mark + Liq.Price снизу). На `≥ md` — прежняя таблица.
-- **Vite-proxy**: в `web/vite.config.ts` подавлены `ECONNRESET` / `EPIPE` ошибки на WS-сокете (это нормальное закрытие при reconnect — раньше засирали dev-консоль).
+*Бэкенд:*
+- `internal/hub/hub.go` — `mergePosition`: WS-дельты Bybit могут приходить с пустыми полями для неизменившихся атрибутов (leverage, liqPrice и т.п.); раньше они затирали уже известные значения, теперь пустое поле сохраняет старое.
+- `Position.TradeMode *int` — добавлено для возможного per-position cross/iso в будущем, но в UI не используется (см. ниже).
+- `Wallet.MarginMode string` — account-level режим маржи, заполняется через `/v5/account/info`. WS-wallet-снапшоты этот поле не присылают, поэтому `ApplyWallet` сохраняет его из старого значения, а `ApplyMarginMode` пушит изменение отдельно.
+- `internal/bybit/rest.go` — новый метод `AccountInfo()` дёргает `/v5/account/info`, возвращает `marginMode`.
+- `internal/bybit/client.go` — в `snapshot()` сначала тянет `AccountInfo`, потом всё остальное. Запущена горутина `pollMarginMode` с тикером 30с (Bybit не присылает изменения marginMode через WS).
 
-**Что НЕ проверено напрямую:**
-- WS-событие `position` — Bybit EU testnet требует KYC для разблокировки деривативов. Код-путь идентичен `wallet` (см. `internal/bybit/ws.go`), который работает. Проверится естественно, когда друг подключит mainnet-ключ.
+*Фронт:*
+- `web/src/lib/components/PositionsTab.svelte` — бейдж `cross`/`iso`/`portfolio` рядом с LONG/SHORT × leverage; источник — `app.wallet?.marginMode`, не `p.tradeMode`. Если leverage пустой/`"0"` — `×N` не рисуется (UTA cross иногда так).
+- `web/src/lib/store.svelte.ts` + `App.svelte` — `app.booting=true` initial, `finally { app.booting = false }` в tryBoot. Пока booting=true рендерится пустой `<div class="min-h-screen">`. Без этого при F5 на доли секунды мигал LoginScreen перед dashboard.
+- `web/src/lib/components/Dashboard.svelte` — активная вкладка персистится в `localStorage` (`bybit-mirror.active-tab`), при F5 не сбрасывается на «Активы».
+- `web/index.html` — `<meta name="robots" content="noindex, nofollow, noarchive, nosnippet">`.
 
-**Что дальше (открыто на следующую сессию):**
+*Инфра:*
+- `deploy/bybit-mirror.service` — systemd unit, юзер `bybit`, hardening.
+- `deploy/bybit-mirror.nginx` — server-block с TLS на 443 (Cloudflare Origin Cert) + 80→443 redirect + анти-индексация + robots.txt + WS-upgrade map.
+- Прод-сервер: Ubuntu/Debian, /opt/bybit-mirror/bybit-mirror, /etc/bybit-mirror/config.json (mode 600 bybit:bybit), /var/www/bybit-front, ufw закрывает 80/443 для всех кроме Cloudflare-диапазонов, cron-скрипт `/usr/local/sbin/update-cf-ufw.sh` обновляет список раз в неделю.
+
+**Открытые вопросы и не сделано:**
 1. Адаптив таблицы монет в `AssetsTab` (сейчас `overflow-auto` — на телефоне горизонтальный скролл). По образцу `PositionsTab`: `md:hidden` карточки + `hidden md:block` таблица.
 2. Cell-flash на апдейте (мигание ячейки при изменении PnL/цены — UX-приятность, как у бирж).
-3. Retry-цикл для REST-снапшота на старте — сейчас одна попытка с 15с timeout, при флапе EU-edge снапшот молча роняется и пользователь видит пустой UI до первого WS-события. По образцу WS-реконнекта: 1с → 2с → ... → 30с, 3-4 попытки.
-4. Деплой: `npm run build` → `web/dist`, nginx-конфиг из секции «Деплой», systemd unit для Go-бинаря.
-5. Подключение mainnet-ключа друга — заменить `api_key`/`api_secret` в `config.json`, поставить `environment: "mainnet"` (и `region` под аккаунт).
+3. Retry-цикл для REST-снапшота на старте — сейчас одна попытка с 20с timeout, при флапе snapshot молча роняется и пользователь видит пустой UI до первого WS-события.
+4. UI настроек для смены API-ключей через дашборд — обсуждалось, не делалось (вариант 3 в DEPLOY.local.md). Сейчас смена ключей — это `ssh + nano /etc/bybit-mirror/config.json + systemctl restart`.
+5. Все сделанные изменения этой сессии — **ещё не закоммичены** в git. Будут отдельной серией коммитов по темам (deploy, hub fixes, marginMode, UI UX).
 
 ## Возможные расширения (если попросят)
 
