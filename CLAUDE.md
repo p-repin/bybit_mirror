@@ -7,22 +7,27 @@
 ## Архитектура
 
 ```
-Bybit private WS ──┐
+Bybit private WS ──┐                                                ┌─► browser clients (WS)
+                   │                                                │
+Bybit public WS    ├──► hub (in-memory state) ──────────────────────┤
+  /linear (mark)   │                                                │
+  /option (mark)   │                                                └─► /api/snapshot (HTTP)
                    │
-Bybit public WS    ├──► hub (in-memory state) ──► browser clients (WS)
-  /linear (mark)   │                          └─► /api/snapshot (HTTP)
-  /option (mark)   │
-                   │
-Bybit REST (init) ─┘
-        ▲
-        └── pollMarginMode каждые 30с (account-level marginMode)
+Bybit REST ────────┘
+  pollWallet 2с      — /v5/account/wallet-balance (canonical totals)
+  pollPositions 10с  — /v5/position/list × 4 (safety-net)
+  pollMarginMode 30с — /v5/account/info (account-level marginMode)
+  snapshot           — то же что pollWallet+pollPositions+pollMarginMode на старте
 ```
 
 - Один процесс держит соединения с Bybit и реплицирует их всем браузерным клиентам.
 - Стейт никогда не персистится — это «зеркало» текущего состояния аккаунта.
-- На старте делается REST-снапшот (`account/info` для marginMode + `wallet-balance` + `position/list` для **linear** USDT/USDC и **option** USDT/USDC), затем подписка на WS-топики `wallet` и `position` приносит дельты.
-- Параллельно горутина `pollMarginMode` каждые 30с дёргает `/v5/account/info` — Bybit не шлёт изменение marginMode (Cross↔Isolated на уровне аккаунта) через WS, и без поллинга UI не подхватывал бы переключение в Bybit-app.
-- **Bybit private `wallet`/`position` event-driven** — пушат на филах, funding, leverage change, ликвидациях, **не** на каждое движение mark-цены. Поэтому отдельно держим **два public-WS соединения** к `/v5/public/linear` и `/v5/public/option` (Bybit разделил public-фиды по категориям), подписываемся на `tickers.<symbol>` для каждой открытой позиции. На тике зовём `hub.ApplyMarkPrice(category, symbol, markPrice)`, который пересчитывает `unrealisedPnl` + `positionValue` по позиции и через `recomputeWalletLocked` — wallet-агрегаты (per-coin UPL/equity/usdValue, totalPerpUPL, totalEquity). Без этого PnL в UI замирал между событиями.
+- **Гибридная схема**: реал-тайм тики приходят из public-WS, авторитетные суммы — из REST-поллов.
+  - **public-WS** (`/v5/public/linear` + `/v5/public/option`, разные endpoint'ы) подписан на `tickers.<symbol>` для каждой открытой позиции. На тике `hub.ApplyMarkPrice` обновляет `markPrice`, пересчитывает `unrealisedPnl = (mark−avg)×size` и `positionValue = size×mark`, пересобирает `totalPerpUPL = Σ position.unrealisedPnl` — это даёт sub-second движение цифр в UI.
+  - **REST `pollWallet` 2с** — `/v5/account/wallet-balance` → `hub.ApplyWallet`. Bybit отдаёт `totalEquity`, `totalWalletBalance`, `totalAvailableBalance`, per-coin `equity/usdValue/walletBalance/unrealisedPnl` уже с учётом bonus, IM-локов, спот-цены не-стейбл монет — реплицировать всё это локально нерально и расходилось бы с Bybit-app. Шапка обновляется раз в 2с, но `totalPerpUPL` продолжает тикать sub-second.
+  - **REST `pollPositions` 10с** — safety-net поверх WS. Перечитывает все 4 (linear/USDT, linear/USDC, option/USDT, option/USDC), зовёт `ApplyPositions` (re-tag category, baseline `liqPrice`/`avgPrice`), и принудительно пинает `SetSymbols` на обоих public-стримах — это триггерит `syncSubs` и резабит то, что Bybit мог отвергнуть.
+  - **REST `pollMarginMode` 30с** — `/v5/account/info` (Bybit не пушит изменения marginMode через WS).
+- **WS-private** (`wallet`/`position`) event-driven (фил, funding, leverage, ликвидация). Используется для немедленной реакции на сделки — не ждать следующий REST-полл.
 
 В проде сервис стоит за **Cloudflare Origin Cert** (nginx → 127.0.0.1:8080), origin закрыт firewall'ом для всего трафика кроме CF edge-диапазонов. Подробности — в `deploy/` и `DEPLOY.local.md` (gitignored, у владельца инстанса).
 
@@ -42,18 +47,32 @@ internal/bybit/ws_public.go — WSPublicClient: public-стрим конкрет
                               (linear или option), подписывается на tickers.<symbol> по
                               текущему набору открытых позиций, sub/unsub батчами по 10,
                               реконнект 1→30с, ping/20с. На тике зовёт hub.ApplyMarkPrice.
-internal/bybit/client.go    — оркестратор: REST snapshot → pollMarginMode → два
-                              WSPublicClient (linear+option) + один WSClient (private).
-                              Хук hub.SetOnPositionsChanged синкает подписки обоих
-                              public-стримов под актуальный набор позиций
+                              syncSubs обновляет c.active ПЕССИМИСТИЧНО (только после
+                              успешного send) — иначе rejected subscribe залипал бы до
+                              реконнекта. dispatch снимает символы с c.active при
+                              op=subscribe success=false, чтобы следующий sync повторил.
+internal/bybit/client.go    — оркестратор: REST snapshot → pollWallet (2с) + pollPositions
+                              (10с) + pollMarginMode (30с) + два WSPublicClient
+                              (linear+option) + один WSClient (private).
+                              pollWallet тянет авторитетные wallet-totals от Bybit
+                              (не считаем сами); pollPositions = safety-net поверх WS,
+                              принудительно пинает SetSymbols на обоих public-стримах
+                              чтобы syncSubs пересубнул то, что было отвергнуто.
+                              Хук hub.SetOnPositionsChanged синкает подписки при
+                              изменении набора символов через WS-дельты (immediate path).
 internal/server/server.go   — http-роуты, login/logout/snapshot
 internal/server/ws.go       — апгрейд /api/ws, ping/30s, pong-deadline 70s
 internal/hub/hub.go         — состояние (Wallet, Positions map, Status); потокобезопасно;
                               mergePosition сохраняет старые поля при WS-дельтах с пустыми значениями;
                               ApplyMarginMode/ApplyWallet защищают marginMode от затирания WS-снапшотом;
+                              ApplyPositions: для новой позиции с пустым Category дефолтит
+                              через categoryFromSymbol (дефис → option, иначе linear) —
+                              иначе Symbols(category) фильтр отбрасывал её, public-WS не
+                              подписывался, новая позиция «застывала» до рестарта;
                               ApplyMarkPrice пересчитывает PnL+positionValue под mark-тики;
-                              recomputeWalletLocked собирает wallet-агрегаты (coin.UPL/equity/usdValue,
-                              totalPerpUPL, totalEquity) из текущих позиций;
+                              recomputeWalletLocked теперь ТОЛЬКО считает totalPerpUPL =
+                              Σ position.unrealisedPnl (остальные wallet-поля canonical
+                              через REST pollWallet);
                               sortedPositions держит детерминированный порядок в broadcast'ах
                               (без неё Go-рандомизация итерации по map'е перетряхивала строки в UI)
 
@@ -85,25 +104,30 @@ deploy/nginx-connection-upgrade.conf — отдельный map-файл для 
    - запускает `bybit.Client.Run(ctx)` в горутине,
    - запускает `http.Server`.
 2. `bybit.Client.Run`:
-   - регистрирует хук `hub.SetOnPositionsChanged` — при изменении набора открытых символов синкает подписки обоих public-WS (`wsLin` на `hub.Symbols("linear")`, `wsOpt` на `hub.Symbols("option")`).
-   - дальше `snapshot()` — REST-вызовы `/v5/account/info` (marginMode), `/v5/account/wallet-balance`, `/v5/position/list` для **4 пар**: `linear/USDT`, `linear/USDC`, `option/USDT`, `option/USDC` (опции без явного pull'а никогда не попадали в state — WS `position` event-driven). Результат заливается в hub через `ApplyMarginMode` / `ApplyWallet` / `ApplyPositions`. Каждая позиция тегается `SettleCoin` из контекста запроса в `rest.Positions`.
-   - стартует `pollMarginMode` — горутина с тикером 30с, дёргает `/v5/account/info` и вызывает `ApplyMarginMode` если значение изменилось.
+   - регистрирует хук `hub.SetOnPositionsChanged` — при изменении набора открытых символов синкает подписки обоих public-WS (`wsLin` на `hub.Symbols("linear")`, `wsOpt` на `hub.Symbols("option")`). Это immediate-path на WS-position event.
+   - дальше `snapshot()` — REST-вызовы `/v5/account/info` (marginMode), `/v5/account/wallet-balance`, `/v5/position/list` для **4 пар**: `linear/USDT`, `linear/USDC`, `option/USDT`, `option/USDC` (опции без явного pull'а никогда не попадали в state — WS `position` event-driven). Результат заливается в hub через `ApplyMarginMode` / `ApplyWallet` / `ApplyPositions`. Каждая позиция тегается `SettleCoin` и `Category` из контекста запроса в `rest.Positions`.
+   - стартует **4 горутины поллинга**:
+     - `pollMarginMode` (30с) — `/v5/account/info` → `ApplyMarginMode` если изменилось.
+     - `pollWallet` (2с) — `/v5/account/wallet-balance` → `ApplyWallet`. Это **главный источник** для `totalEquity`/`totalWalletBalance`/`totalAvailableBalance`/per-coin полей; Bybit считает их сам с учётом bonus/IM-локов/спот-цены.
+     - `pollPositions` (10с) — все 4 категории → `ApplyPositions` → принудительный `SetSymbols` на обоих public-стримах (триггерит `syncSubs` для resub того, что Bybit отверг).
    - стартует две public-WS горутины: `wsLin.Run` (endpoint `/v5/public/linear`) и `wsOpt.Run` (endpoint `/v5/public/option`). Каждая держит свой реконнект-цикл с backoff'ом 1→30с и пингом каждые 20с.
    - потом `WSClient.Run` (private) — бесконечный цикл с реконнектом и backoff'ом.
 3. WS-сообщения от Bybit:
    - **Private** `WSClient.dispatch`:
-     - `topic=wallet` → `hub.ApplyWallet` (перезапись, но `marginMode` сохраняется из старого Wallet если в новом пусто — WS-wallet топик не несёт marginMode; ApplyWallet тут же зовёт `recomputeWalletLocked` чтобы агрегаты были консистентны с позициями) → broadcast `{type:"wallet"}`,
+     - `topic=wallet` → `hub.ApplyWallet` (перезапись, но `marginMode` сохраняется из старого Wallet если в новом пусто — WS-wallet топик не несёт marginMode). Между WS-event и REST-поллом разница в шапке несущественна, но immediate-path даёт мгновенную реакцию на сделку.
      - `topic=position` → `hub.ApplyPositions`. Для каждой позиции из дельты:
+       - если `Category` пуст — дефолт через `categoryFromSymbol` (дефис → `option`, иначе `linear`). Без этого новый символ не попадал в `Symbols("linear")` и public-WS на него не подписывался;
        - `size == "0"` → удаляем из map по ключу `category|symbol|positionIdx`;
-       - позиция уже в map → `mergePosition`: пустые поля в дельте сохраняют старые значения (Bybit шлёт неизменившиеся поля как `""`, иначе их затирали бы); `SettleCoin` тоже сохраняется через merge;
+       - позиция уже в map → `mergePosition`: пустые поля в дельте сохраняют старые значения (Bybit шлёт неизменившиеся поля как `""`, иначе их затирали бы); `SettleCoin`/`Category` тоже сохраняются через merge;
        - новой позиции с пустым size — игнорируем (partial update без known позиции).
-       Дёргается `recomputeWalletLocked`, бродкастится `{type:"positions"}` + `{type:"wallet"}`. Если изменился набор символов — `onPositionsChanged` синкает подписки public-WS.
+       Дёргается `recomputeWalletLocked` (теперь только `totalPerpUPL`), бродкастится `{type:"positions"}` + `{type:"wallet"}`. Если изменился набор символов — `onPositionsChanged` синкает подписки public-WS.
      - сервисные ответы `op=auth/subscribe/pong` логируются если `success=false`.
    - **Public** (`linear` или `option`) `WSPublicClient.dispatch`:
      - `topic=tickers.<symbol>` → берём `markPrice` из payload'а → `hub.ApplyMarkPrice(c.category, symbol, mark)`.
+     - `op=subscribe success=false` → парсим `args`, снимаем символы с `c.active` (иначе залипало до реконнекта).
 4. `hub.ApplyMarkPrice(category, symbol, mark)`:
    - находит позиции с этим `Symbol`+`Category`, обновляет `markPrice`, пересчитывает `unrealisedPnl = (mark − avg) × size` (знак по `Side`) и `positionValue = size × mark` для linear-математики.
-   - дёргает `recomputeWalletLocked`: для каждой позиции по `SettleCoin` (fallback — `settleCoinFromSymbol` по суффиксу символа) суммирует UPL в `coinPnl[settle]`; обновляет `wallet.coin[USDT|USDC].unrealisedPnl`, `equity = walletBalance + pnl`, `usdValue = equity` (для стейблов, 1:1); агрегирует `wallet.totalPerpUPL = ΣPnL` и `wallet.totalEquity = ΣusdValue`.
+   - дёргает `recomputeWalletLocked` — это теперь упрощённая функция, считает только `wallet.totalPerpUPL = Σ position.unrealisedPnl`. Per-coin `equity`/`usdValue`/`unrealisedPnl` и `totalEquity` мы НЕ трогаем — они приходят авторитетными от Bybit через `pollWallet` каждые 2с (приложение считает их с учётом bonus, IM-локов, спот-цены не-стейбл монет; реплицировать локально нерально).
    - бродкастит `{type:"positions"}` + `{type:"wallet"}`.
 5. Браузер коннектится на `/api/ws`:
    - `hub.Register` сразу шлёт `{type:"snapshot", data:{wallet, positions, status}}` (позиции через `sortedPositions` — стабильный порядок),
@@ -258,15 +282,39 @@ npm run build
 - **Позиции перетряхивались в UI** — Go map iteration randomized; добавили `sortedPositions`.
 - **Опции долго не тикали в реал-тайме**, хотя linear уже тикал — Bybit держит public/linear и public/option на **разных endpoint'ах**, нужны **два** WS-соединения. Параметризовал `WSPublicClient` категорией.
 
+**Что сделано в этой сессии (2026-05-11, итерация 3) — гибрид REST-поллинга, freeze-fix:**
+
+Контекст: у итерации 2 был баг расхождения шапки — `Total Equity` не совпадал с Bybit-app, потому что мы серверно собирали `wallet`-агрегаты из позиций (через `recomputeWalletLocked`), а Bybit считает их с учётом bonus / IM-локов / спот-цены не-стейбл монет — реплицировать всё это локально расходилось. Плюс отдельный баг: после открытия позиции на новом символе она «застывала» (mark/PnL не тикали) до перезапуска сервиса.
+
+*Backend (`internal/bybit/client.go`):*
+- **`pollWallet` (2с)** — новая горутина, `/v5/account/wallet-balance` → `hub.ApplyWallet`. Это теперь главный источник для `totalEquity`/`totalWalletBalance`/`totalAvailableBalance` и per-coin полей. Числа точно сходятся с Bybit-app в пределах 2с лага.
+- **`pollPositions` (10с)** — safety-net. Перечитывает все 4 (linear/USDT, linear/USDC, option/USDT, option/USDC), зовёт `ApplyPositions`, и **унконсиционно** пинает `SetSymbols` на обоих public-стримах — это триггерит `syncSubs` и резабит то, что Bybit мог отвергнуть. Заодно перетегает `Category` правильно (REST-контекст), даёт baseline для `liqPrice`/`avgPrice`.
+
+*Backend (`internal/bybit/ws_public.go`):*
+- **`syncSubs` теперь пессимистичен** — `c.active` обновляется ТОЛЬКО после успешного send per-batch. До этого выставлялся оптимистично, и если Bybit отказал в subscribe (`op success=false`) или send тихо проваливался, `c.active` залипал с «claim'ом» подписки, которой нет; следующие `syncSubs` ничего не делали (diff пустой). **Это была главная причина freeze-on-open** — лечилось только реконнектом. Восстановление логично: после неуспеха символ остаётся в `desired` но не в `active`, следующий notify (или `pollPositions`-пинок) попробует снова.
+- **dispatch обрабатывает `op=subscribe success=false`** — парсим `m.Args`, срезаем префикс `tickers.`, удаляем из `c.active`. Без этого пришлось бы ждать реконнект для очистки claim'а.
+
+*Backend (`internal/hub/hub.go`):*
+- **`recomputeWalletLocked` упрощён** — больше не трогает per-coin поля и `totalEquity`. Считает только `totalPerpUPL = Σ position.unrealisedPnl`. Bybit canonical через `pollWallet` побеждает наш расчёт. **Сайд-эффект: фикс залипания PnL в шапке после закрытия позиции** — раньше при удалении последней USDT-позиции `coinPnl["USDT"]` не существовал, цикл делал `continue`, `c.UnrealisedPnl` оставался от старого значения. Теперь сумма по позициям тривиально даёт 0.
+- **Убрана `settleCoinFromSymbol`** — больше не нужна, эвристика по суффиксу никем не вызывается. `Position.SettleCoin` оставлен (поле в JSON-снапшоте + тег из REST-контекста), но не драйвит логику.
+- **Добавлен `categoryFromSymbol`** — дефис в символе → `option`, иначе `linear`. Применяется в `ApplyPositions` для НОВЫХ позиций когда WS-private прислал дельту без `Category` (а это бывает). Без этого `Symbols("linear")` фильтр отбрасывал новый символ → public-WS на него не подписывался → второй уровень freeze-on-open.
+
+*Не трогали:* фронт (`web/`), nginx, systemd, конфиг. WS-фрейм контракт и поля JSON — те же.
+
+*Что проверено в проде:* `Total Equity` синхронизирован с Bybit-app. `Wallet Balance` тоже совпадает (юзер подтвердил после изначального сомнения). После закрытия позиции PnL в шапке моментально обнуляется. Freeze-on-open остаётся в фокусе — баг был воспроизведён ещё после первого фикса (category fallback), и тогда нашли корневую причину в `syncSubs` (пессимизм) — это уже задеплоено, ждём подтверждения от юзера на новой сделке.
+
+*Что НЕ доделано в этой сессии:*
+- Изменения **ещё не закоммичены** в git. Будут серией: hybrid REST poll, syncSubs pessimism, category fallback, recompute simplification.
+
 **Открытые вопросы:**
-1. Подтвердить от юзера: `Total Equity` в нашей шапке должна совпадать с «105 USD» из Bybit-app (главный экран UTA). Wallet Balance 106.20 у нас и у Bybit-app должны совпадать (это разные числа от Total Equity!). Если Total Equity у нас не 105 — копать дальше.
-2. `Available` (`totalAvailableBalance`) серверно не пересчитываем — обсуждали и отвергли (точная формула зависит от cross/iso/portfolio + IM-laddering, приближение разошлось бы с Bybit-app).
-3. `Liq Price` не тикает — реплицировать Bybit-модель сложно, оставили event-driven.
+1. ✅ `Total Equity` совпадает с Bybit-app после перехода на REST-полл wallet (`pollWallet` 2с).
+2. ✅ `Wallet Balance` тоже сошёлся — `totalWalletBalance` идёт от Bybit как есть.
+3. `Liq Price` теперь обновляется раз в 10с через `pollPositions` (baseline от Bybit) — но не sub-second. Реал-тайм liqPrice требовал бы серверной репликации Bybit-модели; не делаем.
 4. Inverse-перпы и опции вне USDT/USDC settle не поддержаны — у друга их нет.
 5. Cell-flash на апдейте — всё ещё в TODO. Mark/PnL/positionValue тикают, можно вешать.
-6. Retry-цикл для REST-снапшота на старте — одна попытка с 20с timeout, при флапе snapshot тихо роняется.
+6. Retry-цикл для REST-снапшота на старте — одна попытка с 20с timeout, при флапе snapshot тихо роняется. С появлением `pollWallet` (2с) и `pollPositions` (10с) это менее критично — следующий полл подтянет.
 7. UI настроек для смены API-ключей через дашборд — пока ssh+systemctl restart.
-8. Все изменения этой сессии — **ещё не закоммичены** в git. Будут серией коммитов по темам (public WS, hub recompute, sort, option support, mobile AssetsTab).
+8. Подтвердить отсутствие freeze-on-open на свежей сделке после деплоя этой итерации.
 
 ## Возможные расширения (если попросят)
 
