@@ -74,6 +74,28 @@ func (c *Config) BybitWSURL() string {
 	}
 }
 
+// BybitPublicLinearWSURL — поток public/linear для тиков markPrice.
+// Demo trading на Bybit делит public стрим с mainnet, отдельного demo-public
+// не существует; testnet же имеет свой stream-testnet.
+func (c *Config) BybitPublicLinearWSURL() string {
+	host := c.bybitHost()
+	if c.Environment == EnvTestnet {
+		return "wss://stream-testnet." + host + "/v5/public/linear"
+	}
+	return "wss://stream." + host + "/v5/public/linear"
+}
+
+// BybitPublicOptionWSURL — поток public/option для тиков markPrice по опциям.
+// Опции живут на отдельном endpoint'е от linear (у Bybit раздельные feed'ы
+// по категориям); demo/testnet — как у linear.
+func (c *Config) BybitPublicOptionWSURL() string {
+	host := c.bybitHost()
+	if c.Environment == EnvTestnet {
+		return "wss://stream-testnet." + host + "/v5/public/option"
+	}
+	return "wss://stream." + host + "/v5/public/option"
+}
+
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {

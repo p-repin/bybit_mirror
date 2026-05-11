@@ -152,6 +152,12 @@ func (c *RESTClient) Positions(ctx context.Context, category, settleCoin string)
 			if r.Result.List[i].Category == "" {
 				r.Result.List[i].Category = r.Result.Category
 			}
+			// Bybit position/list непоследовательно отдаёт settleCoin в payload'е
+			// (особенно для опционов); тегаем сами из контекста запроса —
+			// мы только что спросили его по этому settleCoin'у.
+			if r.Result.List[i].SettleCoin == "" && settleCoin != "" {
+				r.Result.List[i].SettleCoin = settleCoin
+			}
 		}
 		all = append(all, r.Result.List...)
 		if r.Result.NextPageCursor == "" {

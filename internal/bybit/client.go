@@ -10,24 +10,39 @@ import (
 )
 
 type Client struct {
-	cfg *config.Config
-	hub *hub.Hub
-	rst *RESTClient
-	ws  *WSClient
+	cfg   *config.Config
+	hub   *hub.Hub
+	rst   *RESTClient
+	ws    *WSClient
+	wsLin *WSPublicClient
+	wsOpt *WSPublicClient
 }
 
 func NewClient(cfg *config.Config, h *hub.Hub) *Client {
 	return &Client{
-		cfg: cfg,
-		hub: h,
-		rst: NewREST(cfg.BybitRESTURL(), cfg.APIKey, cfg.APISecret),
-		ws:  NewWS(cfg.BybitWSURL(), cfg.APIKey, cfg.APISecret, h),
+		cfg:   cfg,
+		hub:   h,
+		rst:   NewREST(cfg.BybitRESTURL(), cfg.APIKey, cfg.APISecret),
+		ws:    NewWS(cfg.BybitWSURL(), cfg.APIKey, cfg.APISecret, h),
+		wsLin: NewPublicWS(cfg.BybitPublicLinearWSURL(), "linear", h),
+		wsOpt: NewPublicWS(cfg.BybitPublicOptionWSURL(), "option", h),
 	}
 }
 
 func (c *Client) Run(ctx context.Context) {
+	// Хук на изменение набора открытых символов — синкаем подписки обоих
+	// public-стримов (linear и option у Bybit раздельные endpoint'ы).
+	c.hub.SetOnPositionsChanged(func() {
+		c.wsLin.SetSymbols(c.hub.Symbols("linear"))
+		c.wsOpt.SetSymbols(c.hub.Symbols("option"))
+	})
 	c.snapshot(ctx)
+	// Стартовый снапшот уже мог добавить позиции — подтянем подписки сразу.
+	c.wsLin.SetSymbols(c.hub.Symbols("linear"))
+	c.wsOpt.SetSymbols(c.hub.Symbols("option"))
 	go c.pollMarginMode(ctx)
+	go c.wsLin.Run(ctx)
+	go c.wsOpt.Run(ctx)
 	c.ws.Run(ctx)
 }
 
@@ -53,11 +68,23 @@ func (c *Client) snapshot(ctx context.Context) {
 		c.hub.ApplyWallet(*w)
 	}
 
+	// linear + option, оба под USDT и USDC. WS-топик `position` event-driven,
+	// так что без явного REST-pull опции (или непопулярные linear) не появятся
+	// в стейте до тех пор пока с ними что-то не произойдёт.
+	queries := []struct {
+		category, settle string
+	}{
+		{"linear", "USDT"},
+		{"linear", "USDC"},
+		{"option", "USDT"},
+		{"option", "USDC"},
+	}
 	var positions []hub.Position
-	for _, settle := range []string{"USDT", "USDC"} {
-		ps, err := c.rst.Positions(sctx, "linear", settle)
+	for _, q := range queries {
+		ps, err := c.rst.Positions(sctx, q.category, q.settle)
 		if err != nil {
-			slog.Warn("initial positions snapshot failed", "settle", settle, "err", err)
+			slog.Warn("initial positions snapshot failed",
+				"category", q.category, "settle", q.settle, "err", err)
 			continue
 		}
 		positions = append(positions, ps...)

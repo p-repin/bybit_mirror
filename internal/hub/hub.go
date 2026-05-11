@@ -2,6 +2,9 @@ package hub
 
 import (
 	"encoding/json"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -43,8 +46,14 @@ type Position struct {
 	Leverage       string `json:"leverage"`
 	// TradeMode: 0 = cross, 1 = isolated. Указатель — чтобы отличить
 	// «не пришло в WS-дельте» (nil) от «реально 0=cross».
-	TradeMode   *int   `json:"tradeMode,omitempty"`
-	Category    string `json:"category"`
+	TradeMode *int `json:"tradeMode,omitempty"`
+	Category  string `json:"category"`
+	// SettleCoin — в какой валюте денежные поля этой позиции. Bybit V5
+	// в position/list иногда отдаёт, иногда нет; и для опционов
+	// settleCoinFromSymbol-эвристика ломается (символы вида
+	// ETHUSDT-12MAY26-2325-C). Поэтому в REST-снапшоте досыпаем сами
+	// исходя из того, с каким settleCoin'ом запрашивали.
+	SettleCoin  string `json:"settleCoin,omitempty"`
 	UpdatedTime string `json:"updatedTime"`
 }
 
@@ -115,6 +124,10 @@ type Hub struct {
 	state    snapshot
 	clients  map[*Client]struct{}
 	clientMu sync.RWMutex
+	// onPositionsChanged срабатывает после ApplyPositions если набор символов
+	// (а не только их поля) изменился — оркестратор использует это, чтобы
+	// синхронизировать подписки public WS (tickers.<symbol>).
+	onPositionsChanged func()
 }
 
 func New() *Hub {
@@ -125,6 +138,32 @@ func New() *Hub {
 		},
 		clients: make(map[*Client]struct{}),
 	}
+}
+
+func (h *Hub) SetOnPositionsChanged(cb func()) {
+	h.mu.Lock()
+	h.onPositionsChanged = cb
+	h.mu.Unlock()
+}
+
+// Symbols возвращает уникальные symbol'ы открытых позиций для category.
+// Если category пуст — возвращает все.
+func (h *Hub) Symbols(category string) []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	seen := make(map[string]struct{}, len(h.state.Positions))
+	out := make([]string, 0, len(h.state.Positions))
+	for _, p := range h.state.Positions {
+		if category != "" && p.Category != category {
+			continue
+		}
+		if _, ok := seen[p.Symbol]; ok {
+			continue
+		}
+		seen[p.Symbol] = struct{}{}
+		out = append(out, p.Symbol)
+	}
+	return out
 }
 
 func (h *Hub) Register(c *Client) {
@@ -153,8 +192,10 @@ func (h *Hub) ApplyWallet(w Wallet) {
 		w.MarginMode = h.state.Wallet.MarginMode
 	}
 	h.state.Wallet = &w
+	h.recomputeWalletLocked()
+	out := *h.state.Wallet
 	h.mu.Unlock()
-	h.broadcast(Envelope{Type: "wallet", Data: w})
+	h.broadcast(Envelope{Type: "wallet", Data: out})
 }
 
 func (h *Hub) ApplyMarginMode(mode string) {
@@ -171,6 +212,7 @@ func (h *Hub) ApplyMarginMode(mode string) {
 
 func (h *Hub) ApplyPositions(positions []Position) {
 	h.mu.Lock()
+	before := symbolSet(h.state.Positions)
 	for _, p := range positions {
 		k := p.key()
 		if p.Size == "0" {
@@ -186,12 +228,192 @@ func (h *Hub) ApplyPositions(positions []Position) {
 		}
 		h.state.Positions[k] = p
 	}
-	out := make([]Position, 0, len(h.state.Positions))
-	for _, p := range h.state.Positions {
+	after := symbolSet(h.state.Positions)
+	h.recomputeWalletLocked()
+	out := sortedPositions(h.state.Positions)
+	var walletEnv *Envelope
+	if h.state.Wallet != nil {
+		w := *h.state.Wallet
+		walletEnv = &Envelope{Type: "wallet", Data: w}
+	}
+	cb := h.onPositionsChanged
+	h.mu.Unlock()
+	h.broadcast(Envelope{Type: "positions", Data: out})
+	if walletEnv != nil {
+		h.broadcast(*walletEnv)
+	}
+	if cb != nil && !sameSet(before, after) {
+		cb()
+	}
+}
+
+// sortedPositions материализует мапу в детерминированно отсортированный
+// слайс. Без этого порядок в каждом broadcast'е разный (Go рандомизирует
+// итерацию по map), и UI постоянно перетасовывает строки.
+func sortedPositions(m map[string]Position) []Position {
+	out := make([]Position, 0, len(m))
+	for _, p := range m {
 		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Symbol != out[j].Symbol {
+			return out[i].Symbol < out[j].Symbol
+		}
+		if out[i].Side != out[j].Side {
+			return out[i].Side < out[j].Side
+		}
+		return out[i].PositionIdx < out[j].PositionIdx
+	})
+	return out
+}
+
+func symbolSet(m map[string]Position) map[string]struct{} {
+	s := make(map[string]struct{}, len(m))
+	for _, p := range m {
+		s[p.Symbol] = struct{}{}
+	}
+	return s
+}
+
+func sameSet(a, b map[string]struct{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// ApplyMarkPrice апдейтит MarkPrice + пересчитывает UnrealisedPnl и
+// PositionValue для всех позиций по этому symbol/category. Bybit WS-топик
+// `position` event-driven и не шлёт mark-тики; реал-таймовый mark тянется
+// из public-стрима tickers.SYMBOL. Формулы для linear:
+//   pnl   = (mark - avg) * size, знак по Side
+//   value = size * mark (notional, всегда положительный)
+// Дополнительно дёргаем recomputeWalletLocked, чтобы шапка (totalEquity,
+// totalPerpUPL) и вкладка «Монеты» тикали синхронно с позициями.
+func (h *Hub) ApplyMarkPrice(category, symbol, markPrice string) {
+	if markPrice == "" || symbol == "" {
+		return
+	}
+	mark, err := strconv.ParseFloat(markPrice, 64)
+	if err != nil {
+		return
+	}
+	h.mu.Lock()
+	changed := false
+	for k, p := range h.state.Positions {
+		if p.Symbol != symbol || p.Category != category {
+			continue
+		}
+		if p.MarkPrice == markPrice {
+			continue
+		}
+		p.MarkPrice = markPrice
+		size, errS := strconv.ParseFloat(p.Size, 64)
+		avg, errA := strconv.ParseFloat(p.AvgPrice, 64)
+		if errS == nil && errA == nil && size > 0 && avg > 0 {
+			pnl := (mark - avg) * size
+			if p.Side == "Sell" {
+				pnl = -pnl
+			}
+			p.UnrealisedPnl = strconv.FormatFloat(pnl, 'f', -1, 64)
+			p.PositionValue = strconv.FormatFloat(size*mark, 'f', -1, 64)
+		}
+		h.state.Positions[k] = p
+		changed = true
+	}
+	if !changed {
+		h.mu.Unlock()
+		return
+	}
+	h.recomputeWalletLocked()
+	out := sortedPositions(h.state.Positions)
+	var walletEnv *Envelope
+	if h.state.Wallet != nil {
+		w := *h.state.Wallet
+		walletEnv = &Envelope{Type: "wallet", Data: w}
 	}
 	h.mu.Unlock()
 	h.broadcast(Envelope{Type: "positions", Data: out})
+	if walletEnv != nil {
+		h.broadcast(*walletEnv)
+	}
+}
+
+// settleCoinFromSymbol маппит linear-symbol → settle coin.
+// USDT-perp: BTCUSDT, ETHUSDT, ...
+// USDC-perp: BTCUSDC/ETHUSDC (новое именование) + BTCPERP/ETHPERP (старое).
+func settleCoinFromSymbol(symbol string) string {
+	if strings.HasSuffix(symbol, "USDT") {
+		return "USDT"
+	}
+	if strings.HasSuffix(symbol, "USDC") || strings.HasSuffix(symbol, "PERP") {
+		return "USDC"
+	}
+	return ""
+}
+
+// recomputeWalletLocked обновляет per-coin (USDT/USDC) unrealisedPnl и equity
+// исходя из текущего набора позиций, плюс агрегаты totalPerpUPL/totalEquity.
+// Wallet-топик Bybit event-driven, поэтому без этого верх UI замирает между
+// событиями. Должна вызываться под h.mu.Lock.
+func (h *Hub) recomputeWalletLocked() {
+	if h.state.Wallet == nil {
+		return
+	}
+	coinPnl := make(map[string]float64, 2)
+	for _, p := range h.state.Positions {
+		settle := p.SettleCoin
+		if settle == "" {
+			settle = settleCoinFromSymbol(p.Symbol)
+		}
+		if settle == "" {
+			continue
+		}
+		pnl, err := strconv.ParseFloat(p.UnrealisedPnl, 64)
+		if err != nil {
+			continue
+		}
+		coinPnl[settle] += pnl
+	}
+	newCoins := make([]Coin, len(h.state.Wallet.Coins))
+	copy(newCoins, h.state.Wallet.Coins)
+	for i := range newCoins {
+		c := &newCoins[i]
+		pnl, ok := coinPnl[c.Coin]
+		if !ok {
+			continue
+		}
+		c.UnrealisedPnl = strconv.FormatFloat(pnl, 'f', -1, 64)
+		wb, err := strconv.ParseFloat(c.WalletBalance, 64)
+		if err != nil {
+			continue
+		}
+		equity := wb + pnl
+		c.Equity = strconv.FormatFloat(equity, 'f', -1, 64)
+		// Для USDT/USDC usdValue 1:1 c equity. Для других монет (BTC, ETH в кошельке)
+		// usdValue требует спот-цены — оставляем как было от Bybit.
+		if c.Coin == "USDT" || c.Coin == "USDC" {
+			c.UsdValue = strconv.FormatFloat(equity, 'f', -1, 64)
+		}
+	}
+	h.state.Wallet.Coins = newCoins
+
+	var totalUPL, totalEquity float64
+	for _, c := range newCoins {
+		if pnl, err := strconv.ParseFloat(c.UnrealisedPnl, 64); err == nil {
+			totalUPL += pnl
+		}
+		if usd, err := strconv.ParseFloat(c.UsdValue, 64); err == nil {
+			totalEquity += usd
+		}
+	}
+	h.state.Wallet.TotalPerpUPL = strconv.FormatFloat(totalUPL, 'f', -1, 64)
+	h.state.Wallet.TotalEquity = strconv.FormatFloat(totalEquity, 'f', -1, 64)
 }
 
 // Bybit WS-дельты не всегда несут все поля: неизменившиеся приходят
@@ -221,6 +443,7 @@ func mergePosition(old, upd Position) Position {
 		Leverage:       pick(upd.Leverage, old.Leverage),
 		TradeMode:      tradeMode,
 		Category:       pick(upd.Category, old.Category),
+		SettleCoin:     pick(upd.SettleCoin, old.SettleCoin),
 		UpdatedTime:    pick(upd.UpdatedTime, old.UpdatedTime),
 	}
 }
@@ -236,25 +459,17 @@ func (h *Hub) SetStatus(connected bool, lastErr string) {
 func (h *Hub) Snapshot() map[string]any {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	positions := make([]Position, 0, len(h.state.Positions))
-	for _, p := range h.state.Positions {
-		positions = append(positions, p)
-	}
 	return map[string]any{
 		"wallet":    h.state.Wallet,
-		"positions": positions,
+		"positions": sortedPositions(h.state.Positions),
 		"status":    h.state.Status,
 	}
 }
 
 func (h *Hub) snapshotEnvelope() []byte {
-	positions := make([]Position, 0, len(h.state.Positions))
-	for _, p := range h.state.Positions {
-		positions = append(positions, p)
-	}
 	payload := map[string]any{
 		"wallet":    h.state.Wallet,
-		"positions": positions,
+		"positions": sortedPositions(h.state.Positions),
 		"status":    h.state.Status,
 	}
 	b, _ := json.Marshal(Envelope{Type: "snapshot", Data: payload})
