@@ -152,8 +152,15 @@ func (h *Hub) ApplyPositions(positions []Position) {
 	h.mu.Lock()
 	for _, p := range positions {
 		k := p.key()
-		if p.Size == "0" || p.Size == "" {
+		if p.Size == "0" {
 			delete(h.state.Positions, k)
+			continue
+		}
+		if existing, ok := h.state.Positions[k]; ok {
+			h.state.Positions[k] = mergePosition(existing, p)
+			continue
+		}
+		if p.Size == "" {
 			continue
 		}
 		h.state.Positions[k] = p
@@ -164,6 +171,32 @@ func (h *Hub) ApplyPositions(positions []Position) {
 	}
 	h.mu.Unlock()
 	h.broadcast(Envelope{Type: "positions", Data: out})
+}
+
+// Bybit WS-дельты не всегда несут все поля: неизменившиеся приходят
+// пустой строкой. Сохраняем старое значение, если в апдейте пусто.
+func mergePosition(old, upd Position) Position {
+	pick := func(n, o string) string {
+		if n == "" {
+			return o
+		}
+		return n
+	}
+	return Position{
+		Symbol:         pick(upd.Symbol, old.Symbol),
+		Side:           pick(upd.Side, old.Side),
+		Size:           pick(upd.Size, old.Size),
+		PositionIdx:    upd.PositionIdx,
+		AvgPrice:       pick(upd.AvgPrice, old.AvgPrice),
+		MarkPrice:      pick(upd.MarkPrice, old.MarkPrice),
+		UnrealisedPnl:  pick(upd.UnrealisedPnl, old.UnrealisedPnl),
+		CumRealisedPnl: pick(upd.CumRealisedPnl, old.CumRealisedPnl),
+		LiqPrice:       pick(upd.LiqPrice, old.LiqPrice),
+		PositionValue:  pick(upd.PositionValue, old.PositionValue),
+		Leverage:       pick(upd.Leverage, old.Leverage),
+		Category:       pick(upd.Category, old.Category),
+		UpdatedTime:    pick(upd.UpdatedTime, old.UpdatedTime),
+	}
 }
 
 func (h *Hub) SetStatus(connected bool, lastErr string) {
