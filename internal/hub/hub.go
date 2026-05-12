@@ -43,7 +43,12 @@ type Position struct {
 	CumRealisedPnl string `json:"cumRealisedPnl"`
 	LiqPrice       string `json:"liqPrice"`
 	PositionValue  string `json:"positionValue"`
-	Leverage       string `json:"leverage"`
+	// PositionIM — initial margin от Bybit. Для опционов это единственный
+	// корректный источник «сколько залочено», т.к. leverage="" и формула
+	// notional/leverage недоступна; для линейных перпов тоже даёт точную
+	// маржу (Bybit учитывает IM-ladder), а не приближение.
+	PositionIM string `json:"positionIM"`
+	Leverage   string `json:"leverage"`
 	// TradeMode: 0 = cross, 1 = isolated. Указатель — чтобы отличить
 	// «не пришло в WS-дельте» (nil) от «реально 0=cross».
 	TradeMode *int `json:"tradeMode,omitempty"`
@@ -408,6 +413,7 @@ func mergePosition(old, upd Position) Position {
 		CumRealisedPnl: pick(upd.CumRealisedPnl, old.CumRealisedPnl),
 		LiqPrice:       pick(upd.LiqPrice, old.LiqPrice),
 		PositionValue:  pick(upd.PositionValue, old.PositionValue),
+		PositionIM:     pick(upd.PositionIM, old.PositionIM),
 		Leverage:       pick(upd.Leverage, old.Leverage),
 		TradeMode:      tradeMode,
 		Category:       pick(upd.Category, old.Category),

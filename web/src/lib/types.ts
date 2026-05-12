@@ -28,6 +28,7 @@ export interface Position {
   size: string;
   avgPrice: string;
   positionValue: string;
+  positionIM: string;
   unrealisedPnl: string;
   cumRealisedPnl: string;
   leverage: string;

@@ -41,26 +41,20 @@
       {#each app.positions as p (p.category + p.symbol + p.positionIdx)}
         {@const upnl = parseFloat(p.unrealisedPnl)}
         {@const isLong = p.side === "Buy"}
+        {@const im = parseFloat(p.positionIM)}
+        {@const lev = parseFloat(p.leverage)}
+        {@const pv = Math.abs(parseFloat(p.positionValue))}
+        {@const margin = isFinite(im) && im > 0
+          ? im
+          : isFinite(lev) && lev > 0
+            ? pv / lev
+            : NaN}
+        {@const marginFallback = !isFinite(margin) && isFinite(pv) && pv > 0}
         <div class="bg-card p-4">
-          <div class="flex items-center justify-between mb-3">
-            <div class="flex items-center gap-2">
-              <span class="font-semibold text-base">{p.symbol}</span>
-              <span
-                class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium {isLong
-                  ? 'bg-[color:var(--up)]/15 text-[color:var(--up)]'
-                  : 'bg-[color:var(--down)]/15 text-[color:var(--down)]'}"
-              >
-                {isLong ? "LONG" : "SHORT"}
-                {#if p.leverage && p.leverage !== "0"}
-                  <span class="ml-1.5 text-muted-foreground font-normal">×{p.leverage}</span>
-                {/if}
-                {#if marginLabel}
-                  <span class="ml-1.5 text-muted-foreground font-normal">{marginLabel}</span>
-                {/if}
-              </span>
-            </div>
+          <div class="flex items-start justify-between gap-3 mb-2">
+            <span class="font-semibold text-base truncate">{p.symbol}</span>
             <div
-              class="num text-right font-semibold {upnl > 0
+              class="num text-right font-semibold shrink-0 {upnl > 0
                 ? 'text-[color:var(--up)]'
                 : upnl < 0
                   ? 'text-[color:var(--down)]'
@@ -69,6 +63,21 @@
               {upnl > 0 ? "+" : ""}{fmtNum(upnl, 4)}
             </div>
           </div>
+          <div class="mb-3">
+            <span
+              class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium {isLong
+                ? 'bg-[color:var(--up)]/15 text-[color:var(--up)]'
+                : 'bg-[color:var(--down)]/15 text-[color:var(--down)]'}"
+            >
+              {isLong ? "LONG" : "SHORT"}
+              {#if p.leverage && p.leverage !== "0"}
+                <span class="ml-1.5 text-muted-foreground font-normal">×{p.leverage}</span>
+              {/if}
+              {#if marginLabel}
+                <span class="ml-1.5 text-muted-foreground font-normal">{marginLabel}</span>
+              {/if}
+            </span>
+          </div>
           <div class="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
             <div class="flex justify-between">
               <span class="text-muted-foreground">Размер</span>
@@ -76,7 +85,16 @@
             </div>
             <div class="flex justify-between">
               <span class="text-muted-foreground">Margin</span>
-              <span class="num">{fmtNum(p.positionValue, 2)}</span>
+              {#if isFinite(margin)}
+                <span class="num">{fmtNum(margin, 2)}</span>
+              {:else if marginFallback}
+                <span
+                  class="num italic text-muted-foreground"
+                  title="Нотионал |positionValue| — Bybit не отдаёт per-position margin для этого контракта"
+                >~{fmtNum(pv, 2)}</span>
+              {:else}
+                <span class="num">—</span>
+              {/if}
             </div>
             <div class="flex justify-between">
               <span class="text-muted-foreground">Avg</span>
@@ -114,6 +132,15 @@
           {#each app.positions as p (p.category + p.symbol + p.positionIdx)}
             {@const upnl = parseFloat(p.unrealisedPnl)}
             {@const isLong = p.side === "Buy"}
+            {@const im = parseFloat(p.positionIM)}
+            {@const lev = parseFloat(p.leverage)}
+            {@const pv = Math.abs(parseFloat(p.positionValue))}
+            {@const margin = isFinite(im) && im > 0
+              ? im
+              : isFinite(lev) && lev > 0
+                ? pv / lev
+                : NaN}
+            {@const marginFallback = !isFinite(margin) && isFinite(pv) && pv > 0}
             <tr class="border-b last:border-b-0 transition-colors hover:bg-accent/50">
               <td class="px-6 py-3 font-medium">{p.symbol}</td>
               <td class="px-4 py-3">
@@ -137,7 +164,18 @@
               <td class="px-4 py-3 num text-right text-[color:var(--down)]">
                 {fmtNum(p.liqPrice, 2)}
               </td>
-              <td class="px-4 py-3 num text-right">{fmtNum(p.positionValue, 2)}</td>
+              <td class="px-4 py-3 num text-right">
+                {#if isFinite(margin)}
+                  {fmtNum(margin, 2)}
+                {:else if marginFallback}
+                  <span
+                    class="italic text-muted-foreground"
+                    title="Нотионал |positionValue| — Bybit не отдаёт per-position margin для этого контракта"
+                  >~{fmtNum(pv, 2)}</span>
+                {:else}
+                  —
+                {/if}
+              </td>
               <td
                 class="px-6 py-3 num text-right font-medium {upnl > 0
                   ? 'text-[color:var(--up)]'

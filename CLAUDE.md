@@ -306,6 +306,22 @@ npm run build
 *Что НЕ доделано в этой сессии:*
 - Изменения **ещё не закоммичены** в git. Будут серией: hybrid REST poll, syncSubs pessimism, category fallback, recompute simplification.
 
+**Что сделано в этой сессии (2026-05-12) — Margin column + mobile badge layout:**
+
+*Бэкенд (`internal/hub/hub.go`):*
+- Добавлено поле `Position.PositionIM string` (json `positionIM`) + проброс через `mergePosition`. Bybit V5 отдаёт это поле в `/v5/position/list` и WS-private `position` — раньше мы его игнорили при анмаршалле.
+
+*Фронт (`web/src/lib/types.ts`, `web/src/lib/components/PositionsTab.svelte`, `web/src/lib/mockSeed.ts`):*
+- Колонка «Margin» (моб + десктоп) теперь имеет 3-уровневый fallback:
+  1. `positionIM` от Bybit (точная IM с учётом IM-ladder/tier; для перпов и SHORT опционов)
+  2. `|positionValue| / leverage` (если IM пустой но leverage есть)
+  3. `~|positionValue|` курсивом+muted с подсказкой (LONG опционы — Bybit для них `positionIM=""`, т.к. premium уже оплачен авансом, маржи как таковой нет; показываем текущую справедливую стоимость премии)
+  4. `—` если совсем ничего
+- Mobile-карточка реструктурирована: row1 = symbol + UPL (с `truncate`/`shrink-0`), row2 = badge на своей строке, row3 = grid 2×2. Раньше длинные опционные тикеры + бэдж + PnL впритык упирались.
+- В моки досыпан `positionIM` чтобы TS-сборка не падала.
+
+*Почему `Math.abs(positionValue)`:* Bybit для опционных шортов возвращает `positionValue` со знаком минус (short option = liability). Наш `ApplyMarkPrice` пересчитывает на `size×mark` (всегда +), создавая гонку: WS-private пишет `-X`, mark-тик пишет `+X` → мигание в UI и broadcast штормит. Abs в UI съедает мигание; в стейте знак продолжает скакать (можно почистить отдельно если приспичит).
+
 **Открытые вопросы:**
 1. ✅ `Total Equity` совпадает с Bybit-app после перехода на REST-полл wallet (`pollWallet` 2с).
 2. ✅ `Wallet Balance` тоже сошёлся — `totalWalletBalance` идёт от Bybit как есть.
